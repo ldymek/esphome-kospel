@@ -36,6 +36,20 @@ and a supervised autonomous mode with hard guardrails.
   Z-Wave JS Pi; the ESP receives a UDP feed directly from the Pi, so the
   *windows-open → pause heating* failsafe works even with Home Assistant down.
 
+## Screenshots
+
+The AI caretaker's analysis and controls on the main dashboard:
+
+![Main dashboard — AI analysis](docs/img/piec.png)
+
+Wall-panel view (1080p landscape tablet, no scrolling) with the appliance price advisor:
+
+![Wall panel](docs/img/panel.png)
+
+Settings view — Ollama engine, Pstryk API key, autonomy guardrails, Z-Wave controller health:
+
+![Settings](docs/img/settings.png)
+
 ## Hardware
 
 | Part | Notes |
