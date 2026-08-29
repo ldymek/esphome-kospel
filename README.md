@@ -62,6 +62,12 @@ Settings view — Ollama engine, Pstryk API key, autonomy guardrails, Z-Wave con
 
 ## Install
 
+**→ New here? Follow the detailed step-by-step guide: [docs/INSTALL.md](docs/INSTALL.md)**
+(wiring, first USB flash, HA packages, dashboards import, Ollama + AppDaemon setup,
+optional Z-Wave, verification checklist, troubleshooting).
+
+The short version:
+
 ### 1. Firmware (required)
 
 ```bash
