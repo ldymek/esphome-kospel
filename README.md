@@ -1,5 +1,7 @@
 # esphome-kospel
 
+🇵🇱 [Wersja polska](README.pl.md)
+
 **Full local control of a Kospel EKCO.MN3 electric boiler (+ C.MG3 mixing module) over RS485 —
 with an optional local-LLM "AI caretaker" that steers heating around dynamic electricity prices.**
 

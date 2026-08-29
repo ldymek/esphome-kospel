@@ -1,5 +1,7 @@
 # Installation guide — step by step
 
+🇵🇱 [Wersja polska](INSTALL.pl.md)
+
 This walks a new user from an empty KC868-A6 to the full stack. Parts 1–4 are the core
 (heater control in Home Assistant). Parts 5–7 add the AI caretaker. Part 8 is the optional
 Z-Wave TRV layer.
