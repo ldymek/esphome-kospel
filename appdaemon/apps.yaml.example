@@ -1,0 +1,12 @@
+# AppDaemon add-on: /addon_configs/a0d7b954_appdaemon/apps/apps.yaml
+#
+# Canonical app configuration (AppDaemon docs: apps.yaml args + !secret).
+# Secrets referenced with !secret live in /addon_configs/a0d7b954_appdaemon/secrets.yaml.
+# The dashboard "Ustawienia" helpers act as RUNTIME OVERRIDES on top of these:
+#   Pstryk key:  input_text.kospel_pstryk_api_key  >  pstryk_api_key arg  >  .pstryk-key file
+#   Ollama host: input_text.kospel_llm_host        >  ollama_host arg
+kospel_llm:
+  module: kospel_llm
+  class: KospelLLM
+  ollama_host: http://192.168.1.21:11434     # EDIT ME
+  pstryk_api_key: !secret pstryk_api_key     # or leave out and use the UI field / key file

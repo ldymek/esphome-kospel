@@ -1,0 +1,110 @@
+# /config/packages/kospel_energia.yaml — Kospel CO/CWU energy + cost stack (billing-grade).
+# Restart-proof YAML (the old API-pushed kospel_koszt_* sensors died with the GPU-box daemon).
+# Power is split by the heater's own demand flags; energy via Riemann integral (kWh, Energy
+# Dashboard ready); cost via integral of kW x Pstryk hourly price (PLN, exact at 20 s cadence).
+# Totals are state_class total/total_increasing -> HA long-term statistics keep them FOREVER
+# (recorder purge never touches statistics) -> season billing = suma at end minus at start,
+# or the monthly utility_meter values.
+
+template:
+  - sensor:
+      - name: "Kospel moc CO"
+        unique_id: kospel_moc_co
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.kc868_heater_heater_power_now') not in ['unknown','unavailable'] }}
+        state: >
+          {% set p = states('sensor.kc868_heater_heater_power_now') | float(0) %}
+          {{ p if is_state('binary_sensor.kc868_heater_heater_co_demand', 'on') else 0 }}
+      - name: "Kospel moc CWU"
+        unique_id: kospel_moc_cwu
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.kc868_heater_heater_power_now') not in ['unknown','unavailable'] }}
+        state: >
+          {% set p = states('sensor.kc868_heater_heater_power_now') | float(0) %}
+          {{ p if is_state('binary_sensor.kc868_heater_heater_dhw_demand', 'on') else 0 }}
+      - name: "Kospel koszt CO tempo"
+        unique_id: kospel_koszt_co_tempo
+        unit_of_measurement: "PLN/h"
+        state_class: measurement
+        availability: >
+          {{ states('sensor.kospel_moc_co') not in ['unknown','unavailable']
+             and states('sensor.kospel_cena_zakupu_teraz') not in ['unknown','unavailable'] }}
+        state: >
+          {{ (states('sensor.kospel_moc_co') | float(0)
+              * states('sensor.kospel_cena_zakupu_teraz') | float(0)) | round(4) }}
+      - name: "Kospel koszt CWU tempo"
+        unique_id: kospel_koszt_cwu_tempo
+        unit_of_measurement: "PLN/h"
+        state_class: measurement
+        availability: >
+          {{ states('sensor.kospel_moc_cwu') not in ['unknown','unavailable']
+             and states('sensor.kospel_cena_zakupu_teraz') not in ['unknown','unavailable'] }}
+        state: >
+          {{ (states('sensor.kospel_moc_cwu') | float(0)
+              * states('sensor.kospel_cena_zakupu_teraz') | float(0)) | round(4) }}
+
+sensor:
+  # kWh (Energy Dashboard sources)
+  - platform: integration
+    source: sensor.kospel_moc_co
+    name: "Kospel energia CO"
+    unique_id: kospel_energia_co
+    unit_time: h
+    method: left
+    round: 3
+  - platform: integration
+    source: sensor.kospel_moc_cwu
+    name: "Kospel energia CWU"
+    unique_id: kospel_energia_cwu
+    unit_time: h
+    method: left
+    round: 3
+  # PLN grand totals (never reset — the season bill is end-minus-start)
+  - platform: integration
+    source: sensor.kospel_koszt_co_tempo
+    name: "Kospel koszt CO suma"
+    unique_id: kospel_koszt_co_suma
+    unit_time: h
+    method: left
+    round: 2
+  - platform: integration
+    source: sensor.kospel_koszt_cwu_tempo
+    name: "Kospel koszt CWU suma"
+    unique_id: kospel_koszt_cwu_suma
+    unit_time: h
+    method: left
+    round: 2
+
+utility_meter:
+  # PLN per day / month (same entity ids the dashboard already shows)
+  kospel_koszt_co_dzisiaj:
+    name: "Kospel koszt CO dzisiaj"
+    source: sensor.kospel_koszt_co_suma
+    cycle: daily
+  kospel_koszt_cwu_dzisiaj:
+    name: "Kospel koszt CWU dzisiaj"
+    source: sensor.kospel_koszt_cwu_suma
+    cycle: daily
+  kospel_koszt_co_miesiac:
+    name: "Kospel koszt CO miesiąc"
+    source: sensor.kospel_koszt_co_suma
+    cycle: monthly
+  kospel_koszt_cwu_miesiac:
+    name: "Kospel koszt CWU miesiąc"
+    source: sensor.kospel_koszt_cwu_suma
+    cycle: monthly
+  # kWh per month (billing table: months of the season)
+  kospel_energia_co_miesiac:
+    name: "Kospel energia CO miesiąc"
+    source: sensor.kospel_energia_co
+    cycle: monthly
+  kospel_energia_cwu_miesiac:
+    name: "Kospel energia CWU miesiąc"
+    source: sensor.kospel_energia_cwu
+    cycle: monthly

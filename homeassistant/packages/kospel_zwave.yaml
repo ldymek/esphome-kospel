@@ -1,0 +1,41 @@
+# Replace ZWAVE_PI_HOME_IP / ZWAVE_PI_GARAGE_IP with your Pi addresses.
+# Kospel Z-Wave controller self-healing (agents on the Z-Wave Pis).
+rest_command:
+  zwave_restart_home:
+    url: "http://ZWAVE_PI_HOME_IP:8901/restart"
+    method: POST
+    headers: { X-Token: !secret zwave_agent_token }
+    timeout: 120
+  zwave_update_home:
+    url: "http://ZWAVE_PI_HOME_IP:8901/update"
+    method: POST
+    headers: { X-Token: !secret zwave_agent_token }
+    timeout: 600
+  zwave_restart_garage:
+    url: "http://ZWAVE_PI_GARAGE_IP:8901/restart"
+    method: POST
+    headers: { X-Token: !secret zwave_agent_token }
+    timeout: 120
+  zwave_update_garage:
+    url: "http://ZWAVE_PI_GARAGE_IP:8901/update"
+    method: POST
+    headers: { X-Token: !secret zwave_agent_token }
+    timeout: 600
+
+sensor:
+  - platform: rest
+    name: Zwave home health
+    unique_id: zwave_home_health
+    resource: "http://ZWAVE_PI_HOME_IP:8901/health"
+    scan_interval: 60
+    timeout: 10
+    value_template: "{{ 'on' if value_json.running else 'off' }}"
+    json_attributes: [image, driver_version, schema, disk_pct, restarts, error, data_age_s]
+  - platform: rest
+    name: Zwave garage health
+    unique_id: zwave_garage_health
+    resource: "http://ZWAVE_PI_GARAGE_IP:8901/health"
+    scan_interval: 60
+    timeout: 10
+    value_template: "{{ 'on' if value_json.running else 'off' }}"
+    json_attributes: [image, driver_version, schema, disk_pct, restarts, error, data_age_s]

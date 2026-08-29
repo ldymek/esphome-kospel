@@ -1,0 +1,199 @@
+{
+ "views": [
+  {
+   "title": "Ustawienia",
+   "path": "ustawienia",
+   "icon": "mdi:cog",
+   "type": "sections",
+   "max_columns": 3,
+   "sections": [
+    {
+     "type": "grid",
+     "cards": [
+      {
+       "type": "heading",
+       "heading": "Asystent AI — silnik (Ollama)",
+       "heading_style": "title",
+       "icon": "mdi:brain"
+      },
+      {
+       "type": "entities",
+       "entities": [
+        {
+         "entity": "input_text.kospel_llm_host",
+         "name": "Adres serwera Ollama"
+        },
+        {
+         "entity": "input_select.kospel_llm_model",
+         "name": "Model"
+        },
+        {
+         "entity": "input_boolean.kospel_llm_thinking",
+         "name": "Tryb myślenia (wolniejszy)"
+        },
+        {
+         "entity": "input_number.kospel_llm_temperatura",
+         "name": "Temperatura (kreatywność)"
+        },
+        {
+         "entity": "input_number.kospel_llm_interwal_h",
+         "name": "Interwał analiz [h]"
+        }
+       ]
+      },
+      {
+       "type": "markdown",
+       "content": "Model musi być wcześniej pobrany na serwerze (`ollama pull <model>`). Zmiany działają od następnej analizy."
+      }
+     ]
+    },
+    {
+     "type": "grid",
+     "cards": [
+      {
+       "type": "heading",
+       "heading": "Pstryk — ceny energii",
+       "heading_style": "title",
+       "icon": "mdi:cash-clock"
+      },
+      {
+       "type": "entities",
+       "entities": [
+        {
+         "entity": "input_text.kospel_pstryk_api_key",
+         "name": "Klucz API (pstryk.pl)"
+        },
+        {
+         "entity": "sensor.kospel_cena_zakupu_teraz",
+         "name": "Cena teraz (test działania)"
+        }
+       ]
+      },
+      {
+       "type": "markdown",
+       "content": "Klucz z portalu pstryk.pl → Integracje → API. To pole to nadpisanie działające od ręki; docelowo klucz trzymaj w `secrets.yaml` AppDaemona (`pstryk_api_key`, patrz apps.yaml). Kolejność: to pole → apps.yaml → plik `.pstryk-key`."
+      }
+     ]
+    },
+    {
+     "type": "grid",
+     "cards": [
+      {
+       "type": "heading",
+       "heading": "Guardraile autonomii",
+       "heading_style": "title",
+       "icon": "mdi:shield-check"
+      },
+      {
+       "type": "entities",
+       "entities": [
+        {
+         "entity": "input_number.kospel_ai_min_pokoj",
+         "name": "Minimalna temp. pokojowa"
+        },
+        {
+         "entity": "input_number.kospel_okna_prog",
+         "name": "Próg otwartych okien (wietrzenie)"
+        },
+        {
+         "entity": "input_boolean.kospel_wietrzenie_auto",
+         "name": "Automatyka wietrzenia"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "type": "grid",
+     "cards": [
+      {
+       "type": "heading",
+       "heading": "Z-Wave — kontrolery (Pi)",
+       "heading_style": "title",
+       "icon": "mdi:z-wave"
+      },
+      {
+       "type": "entities",
+       "entities": [
+        {
+         "entity": "sensor.zwave_home_health",
+         "name": "Dom — kontener zdrowy"
+        },
+        {
+         "entity": "sensor.zwave_garage_health",
+         "name": "Garaż — kontener zdrowy"
+        },
+        {
+         "entity": "sensor.kc868_heater_trv_najzimniejszy_pokoj_esp",
+         "name": "TRV → ESP (świeżość danych)"
+        }
+       ]
+      },
+      {
+       "type": "horizontal-stack",
+       "cards": [
+        {
+         "type": "button",
+         "name": "Restart DOM",
+         "icon": "mdi:restart",
+         "tap_action": {
+          "action": "call-service",
+          "service": "rest_command.zwave_restart_home",
+          "confirmation": {
+           "text": "Zrestartować kontener zwave-js (dom)?"
+          }
+         }
+        },
+        {
+         "type": "button",
+         "name": "Restart GARAŻ",
+         "icon": "mdi:restart",
+         "tap_action": {
+          "action": "call-service",
+          "service": "rest_command.zwave_restart_garage",
+          "confirmation": {
+           "text": "Zrestartować kontener zwave-js (garaż)?"
+          }
+         }
+        }
+       ]
+      },
+      {
+       "type": "horizontal-stack",
+       "cards": [
+        {
+         "type": "button",
+         "name": "Update DOM",
+         "icon": "mdi:update",
+         "tap_action": {
+          "action": "call-service",
+          "service": "rest_command.zwave_update_home",
+          "confirmation": {
+           "text": "Zaktualizować obraz zwave-js (dom)? Rollback-safe."
+          }
+         }
+        },
+        {
+         "type": "button",
+         "name": "Update GARAŻ",
+         "icon": "mdi:update",
+         "tap_action": {
+          "action": "call-service",
+          "service": "rest_command.zwave_update_garage",
+          "confirmation": {
+           "text": "Zaktualizować obraz zwave-js (garaż)? Rollback-safe."
+          }
+         }
+        }
+       ]
+      },
+      {
+       "type": "markdown",
+       "content": "Kontrolery aktualizują się same (niedziela 04:00) i restartują po awarii — te przyciski są do ręcznej interwencji."
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

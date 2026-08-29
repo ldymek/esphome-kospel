@@ -1,0 +1,17 @@
+# /etc/systemd/system/zwave-agent.service  (Raspberry Pi with zwave-js container)
+[Unit]
+Description=Z-Wave keeper agent (health/restart/update + TRV feed for the Kospel ESP)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/zwave-agent/zwave_agent.py
+Environment=ZW_AGENT_TOKEN=CHANGE-ME-long-random     # protects POST /restart and /update
+Environment=ZW_WS=ws://127.0.0.1:3000
+# Environment=ZW_COMPOSE_DIR=/root/zwavejs2mqtt      # set if the container is docker-compose managed
+# Environment=ZW_ESP_UDP=192.168.1.221:8902          # Kospel ESP UDP push target ('' disables)
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

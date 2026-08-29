@@ -1,0 +1,187 @@
+{
+ "views": [
+  {
+   "title": "Kocioł",
+   "path": "panel",
+   "icon": "mdi:water-boiler",
+   "type": "sections",
+   "max_columns": 2,
+   "dense_section_placement": true,
+   "sections": [
+    {
+     "type": "grid",
+     "cards": [
+      {
+       "type": "history-graph",
+       "hours_to_show": 12,
+       "entities": [
+        {
+         "entity": "sensor.kc868_heater_heater_co_inlet_temp",
+         "name": "CO zasilanie"
+        },
+        {
+         "entity": "sensor.kc868_heater_heater_co_outlet_temp",
+         "name": "CO powrót"
+        },
+        {
+         "entity": "sensor.kc868_heater_heater_dhw_temp",
+         "name": "CWU"
+        },
+        {
+         "entity": "sensor.kc868_heater_heater_room_temp",
+         "name": "Pokój"
+        },
+        {
+         "entity": "sensor.kc868_heater_heater_outside_temp",
+         "name": "Zewnątrz"
+        }
+       ],
+       "grid_options": {
+        "columns": 12,
+        "rows": 5
+       }
+      },
+      {
+       "type": "conditional",
+       "conditions": [
+        {
+         "condition": "state",
+         "entity": "binary_sensor.kc868_heater_heater_alarm",
+         "state": "on"
+        }
+       ],
+       "card": {
+        "type": "tile",
+        "entity": "sensor.kc868_heater_heater_error",
+        "name": "ALARM",
+        "color": "red",
+        "icon": "mdi:alert",
+        "grid_options": {
+         "columns": 12,
+         "rows": 1
+        }
+       }
+      },
+      {
+       "type": "markdown",
+       "grid_options": {
+        "columns": 12,
+        "rows": 2
+       },
+       "content": "**💡 {{ states('sensor.kospel_rada_urzadzenia') }}.** {{ state_attr('sensor.kospel_rada_urzadzenia','rada') }} Unikaj szczytu: {{ state_attr('sensor.kospel_rada_urzadzenia','unikaj') }}."
+      }
+     ]
+    },
+    {
+     "type": "grid",
+     "cards": [
+      {
+       "type": "gauge",
+       "entity": "sensor.kc868_heater_heater_power_now",
+       "name": "Moc",
+       "unit": "kW",
+       "min": 0,
+       "max": 24,
+       "needle": true,
+       "severity": {
+        "green": 0,
+        "yellow": 12,
+        "red": 20
+       },
+       "grid_options": {
+        "columns": 6,
+        "rows": 3
+       }
+      },
+      {
+       "type": "gauge",
+       "entity": "sensor.kc868_heater_heater_water_pressure",
+       "name": "Ciśnienie",
+       "unit": "bar",
+       "min": 0,
+       "max": 3,
+       "needle": true,
+       "severity": {
+        "red": 0,
+        "green": 1,
+        "yellow": 2.2
+       },
+       "grid_options": {
+        "columns": 6,
+        "rows": 3
+       }
+      },
+      {
+       "type": "tile",
+       "entity": "sensor.kospel_cena_zakupu_teraz",
+       "name": "Cena teraz",
+       "icon": "mdi:cash-clock",
+       "color": "green",
+       "grid_options": {
+        "columns": 6,
+        "rows": 1
+       }
+      },
+      {
+       "type": "tile",
+       "entity": "sensor.dom_otwarte_okna",
+       "name": "Otwarte okna",
+       "icon": "mdi:window-open-variant",
+       "color": "blue",
+       "grid_options": {
+        "columns": 6,
+        "rows": 1
+       }
+      },
+      {
+       "type": "tile",
+       "entity": "sensor.kospel_koszt_co_dzisiaj",
+       "name": "Koszt CO dziś",
+       "icon": "mdi:radiator",
+       "grid_options": {
+        "columns": 6,
+        "rows": 1
+       }
+      },
+      {
+       "type": "tile",
+       "entity": "sensor.kospel_koszt_cwu_dzisiaj",
+       "name": "Koszt CWU dziś",
+       "icon": "mdi:shower-head",
+       "grid_options": {
+        "columns": 6,
+        "rows": 1
+       }
+      },
+      {
+       "type": "button",
+       "name": "Za zimno ▲",
+       "icon": "mdi:thermometer-plus",
+       "tap_action": {
+        "action": "call-service",
+        "service": "script.kospel_za_zimno"
+       },
+       "grid_options": {
+        "columns": 6,
+        "rows": 2
+       }
+      },
+      {
+       "type": "button",
+       "name": "Za ciepło ▼",
+       "icon": "mdi:thermometer-minus",
+       "tap_action": {
+        "action": "call-service",
+        "service": "script.kospel_za_cieplo"
+       },
+       "grid_options": {
+        "columns": 6,
+        "rows": 2
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

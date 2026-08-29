@@ -1,0 +1,7 @@
+secrets.yaml
+*.key
+.pstryk-key
+.ha-token
+.zwave-agent-token
+__pycache__/
+.esphome/

@@ -1,0 +1,68 @@
+# /config/packages/kospel_helpers.yaml — input helpers the AI maintainer (AppDaemon) expects.
+# Requires: homeassistant: packages: !include_dir_named packages
+input_select:
+  kospel_llm_tryb:
+    name: "AI — tryb pracy"
+    options: ["Doradca (tylko opis)", "Propozycje (shadow)", "Autonomiczny"]
+    initial: "Doradca (tylko opis)"
+    icon: mdi:robot
+  kospel_llm_model:
+    name: "AI — model (Ollama)"
+    options: ["gemma4:26b-a4b-it-qat", "qwen3:30b", "llama4:8b"]   # EDIT ME: models you host
+    icon: mdi:brain
+
+input_boolean:
+  kospel_llm_enable:
+    name: "AI — analizy cykliczne"
+    icon: mdi:robot-outline
+  kospel_llm_thinking:
+    name: "AI — tryb myślenia (wolniejszy)"
+    icon: mdi:thought-bubble
+  kospel_llm_run_now:
+    name: "AI — uruchom teraz"
+    icon: mdi:play
+  kospel_wietrzenie_auto:
+    name: "Wietrzenie — automatyka okien"
+    icon: mdi:window-open-variant
+
+input_number:
+  kospel_llm_interwal_h:
+    name: "AI — interwał analiz [h]"
+    min: 1
+    max: 24
+    step: 1
+    initial: 6
+  kospel_ai_min_pokoj:
+    name: "AI — minimalna temp. pokojowa (watchdog)"
+    min: 15
+    max: 24
+    step: 0.5
+    initial: 19
+    unit_of_measurement: "°C"
+  kospel_llm_temperatura:
+    name: "AI — temperatura LLM"
+    min: 0
+    max: 1
+    step: 0.05
+    initial: 0.2
+  kospel_okna_prog:
+    name: "Wietrzenie — próg otwartych okien"
+    min: 1
+    max: 6
+    step: 1
+    initial: 2
+
+input_text:
+  kospel_llm_host:
+    name: "AI — adres Ollama"
+    initial: "http://192.168.1.21:11434"   # EDIT ME
+  kospel_llm_status:
+    name: "AI — status"
+  kospel_llm_last_summary:
+    name: "AI — ostatnie podsumowanie"
+    max: 255
+  kospel_pstryk_api_key:
+    name: "Pstryk — klucz API"
+    icon: mdi:key-variant
+    mode: password
+    max: 255
