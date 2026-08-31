@@ -24,6 +24,9 @@ input_boolean:
   kospel_wietrzenie_auto:
     name: "Wietrzenie — automatyka okien"
     icon: mdi:window-open-variant
+  kospel_ai_moc_auto:
+    name: "AI — limit mocy wg cen"
+    icon: mdi:speedometer-slow
 
 input_number:
   kospel_llm_interwal_h:

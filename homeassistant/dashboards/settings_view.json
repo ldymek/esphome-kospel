@@ -98,6 +98,10 @@
         {
          "entity": "input_boolean.kospel_wietrzenie_auto",
          "name": "Automatyka wietrzenia"
+        },
+        {
+         "entity": "input_boolean.kospel_ai_moc_auto",
+         "name": "Limit mocy wg cen (12/20/24 kW)"
         }
        ]
       }

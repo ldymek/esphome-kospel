@@ -30,6 +30,9 @@ and a supervised autonomous mode with hard guardrails.
   daily programs into the heater's unused **program 8** (shadow mode) or actively points the week
   at them (**Autonomiczny**) with watchdog + automatic rollback. Learns the household's hot-water
   rhythm from tank-temperature draw detection — no water meter needed.
+- **Price-driven power cap (opt-in)** — during expensive hours the heater's max power is
+  limited to 12 kW, normal hours 20 kW, cheap hours full 24 kW; comfort floor and
+  anti-legionella always force full power; your own setting returns when autonomy exits.
 - **Billing-grade energy/cost stack** — CO/CWU split power → kWh meters → PLN totals at exact
   hourly prices (Energy-Dashboard-ready, statistics kept forever).
 - **Wall-panel dashboard** (1080p landscape tablet) + appliance advice card

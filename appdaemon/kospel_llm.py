@@ -410,6 +410,12 @@ class KospelLLM(hass.Hass):
                                       entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
                     return
                 backup[f"{wk}_{d}"] = v
+        # power cap is part of the managed state: remember the user's max-power index too
+        # (key doubles as the entity suffix: number.kc868_heater_heater_max_power_index)
+        try:
+            backup["heater_max_power_index"] = int(float(self.stt("number.kc868_heater_heater_max_power_index")))
+        except (TypeError, ValueError):
+            pass
         for wk in self.AUTON_WEEKLY:
             for d in self.DAYS:
                 self.call_service("number/set_value",
@@ -503,6 +509,38 @@ class KospelLLM(hass.Hass):
                 self.disengage_autonomy(f"watchdog: pokój {room:.1f}°C < próg {floor:.1f}°C")
                 self.call_service("input_select/select_option",
                                   entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
+            else:
+                self.power_cap_tick(room, floor)
+
+    # ---------- price-driven power cap (opt-in, autonomy only) ----------
+    # The schedules steer WHAT temperature to hold; this caps HOW HARD the heater may pull while
+    # doing it: expensive hour -> 12 kW, normal -> 20 kW, cheap -> 24 kW (indices 0/2/3).
+    # Full power is always restored when comfort is at risk or disinfection runs. The user's own
+    # setting is in the autonomy backup and returns on disengage.
+    def power_cap_tick(self, room, floor):
+        if self.stt("input_boolean.kospel_ai_moc_auto") != "on": return
+        prices = getattr(self, "last_prices", None)
+        if not prices or prices.get("now") is None: return
+        if self.stt("binary_sensor.kc868_heater_dezynfekcja_aktywna") == "on":
+            target = 3                       # anti-legionella needs full power
+        elif room is not None and room < floor + 0.5:
+            target = 3                       # comfort at risk beats savings
+        elif prices.get("exp_now"):
+            target = 0                       # 12 kW through the price peak
+        elif prices.get("cheap_now"):
+            target = 3                       # 24 kW to charge tank/building fast
+        else:
+            target = 2                       # 20 kW default
+        try: cur = int(float(self.stt("number.kc868_heater_heater_max_power_index")))
+        except (TypeError, ValueError): return
+        now = time.time()
+        if target == cur or now - getattr(self, "_pcap_last", 0) < 600: return
+        self._pcap_last = now
+        self.call_service("number/set_value",
+                          entity_id="number.kc868_heater_heater_max_power_index", value=target)
+        kw = {0: 12, 1: 16, 2: 20, 3: 24}
+        self.log(f"AUTONOMY: limit mocy {kw.get(cur,'?')} -> {kw[target]} kW "
+                 f"(cena {prices['now']} zł/kWh, exp={prices.get('exp_now')}, cheap={prices.get('cheap_now')})")
 
     # ---------- AI schedule proposal -> write to CO program 8 ----------
     AI_PROG_NR = 8
@@ -753,7 +791,8 @@ class KospelLLM(hass.Hass):
                 self.log(f"dhw_usage error: {type(e).__name__} {str(e)[:120]}", level="WARNING")
             now = time.time()
             if now - self.last_price >= 900 or self.get_state("sensor.kospel_cena_zakupu_teraz") is None:
-                self.publish_price_sensor(self.fetch_prices())
+                self.last_prices = self.fetch_prices()   # cached for the power-cap tick
+                self.publish_price_sensor(self.last_prices)
                 self.last_price = now
             if self.get_state("sensor.kospel_llm_analiza") is None:
                 try:
