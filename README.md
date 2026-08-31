@@ -180,6 +180,22 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - **Season needs the DHW tank enabled first** — writing summer while the tank is off silently
   reverts (see docs/CONFIG-FLAGS.md). The heater owns `0x0B55`; enable preconditions, then season.
 
+## Roadmap
+
+- **Custom Home Assistant integration** (`custom_components/`) with a config-flow settings page —
+  so the project shows up as a real HA integration (Ollama host, Pstryk key, etc.) instead of
+  AppDaemon + helpers.
+- **Symbolic config-flag write layer** — the C.MI writes flags like `FLAG_DHW_ACTIVATION_NO_YES`
+  as named transactions (server-side register mapping). The ESP already covers season + the main
+  enable flags via per-bit RMW switches (see docs/CONFIG-FLAGS.md); porting the *remaining* gated
+  config groups (buffer/OPERATING_MODE, DHW int/ext with supply temp) is the last parity gap.
+- **Boiler soft-restart** (C.MI "restart kotła" = `FLAG_RESET_MSK`). The Modbus register is not
+  yet mapped — the C.MI resolves the flag name server-side and it is never emitted in captures.
+  Discovery procedure (deliberate, reboots the heater once): flash the RS485 write-sniffer, hand
+  the bus to the C.MI, trigger the reset from the C.MI, capture the single write frame, port it as
+  an ESP `button`. Left unmapped rather than guessed — a wrong write to `0x0B55` once disabled the
+  DHW tank (see docs/CONFIG-FLAGS.md), so unknown registers are never written blind.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

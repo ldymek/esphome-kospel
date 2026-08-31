@@ -187,6 +187,20 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - Sensor alarmu kotła liczony z jeszcze-nieodczytanego rejestru przez chwilę po każdym reboocie
   zwraca śmieci — zabezpiecz NaN i debounce'uj watchdogi, które na nim działają.
 
+## Roadmapa
+
+- **Własna integracja Home Assistant** (`custom_components/`) z config-flow — projekt jako
+  prawdziwa integracja HA (host Ollama, klucz Pstryk itd.) zamiast AppDaemon + helpery.
+- **Warstwa symbolicznego zapisu flag** — C.MI zapisuje flagi (np. `FLAG_DHW_ACTIVATION_NO_YES`)
+  jako nazwane transakcje (mapowanie rejestrów po stronie serwera). ESP pokrywa już sezon +
+  główne flagi włączające przez przełączniki RMW (patrz docs/CONFIG-FLAGS.md); dokończenie
+  pozostałych „gated" grup to ostatnia luka parytetu.
+- **Miękki restart kotła** (C.MI „restart kotła" = `FLAG_RESET_MSK`). Rejestr Modbus nie jest
+  jeszcze zmapowany — C.MI rozwiązuje nazwę flagi po stronie serwera i nie widać jej w przechwytach.
+  Procedura odkrycia (celowa, restartuje kocioł raz): wgraj sniffer zapisów RS485, przekaż szynę
+  C.MI, wywołaj restart z C.MI, przechwyć ramkę zapisu, przenieś jako ESP `button`. Zostawione
+  niezmapowane zamiast zgadywania — błędny zapis do `0x0B55` raz wyłączył zasobnik CWU.
+
 ## Licencja
 
 MIT — patrz [LICENSE](LICENSE).
