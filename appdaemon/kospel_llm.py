@@ -288,6 +288,20 @@ class KospelLLM(hass.Hass):
         return self.ollama_chat(cfg["host"], cfg["model"], SYSTEM, user,
                                 thinking=cfg["thinking"], temp=cfg["temp"], npredict=600)
 
+    def price_context(self, prices):
+        """Absolute framing so the LLM knows if the WHOLE day is dear or cheap (typical PLN/kWh:
+        tanie doby schodzą do ~0.2-0.4, drogie szczyty siegają ~2+)."""
+        vals = [r["full"] for r in prices.get("all", prices["curve"])]
+        if not vals: return ""
+        v = sorted(vals); med = v[len(v)//2]
+        lo, hi = min(vals), max(vals)
+        level = ("DROGA (nawet minimum jest wysokie)" if lo > 0.7
+                 else "TANIA (duzo bardzo tanich godzin)" if med < 0.6 else "typowa")
+        return (f"\nKontekst absolutny: widoczne ceny {lo:.2f}-{hi:.2f} zl/kWh, mediana {med:.2f}. "
+                f"To doba {level}. Oceniaj 'tanio/drogo' wzgledem calej doby, ale gdy dzien jest "
+                f"ogolnie drogi, powiedz to wprost i preferuj minimalne zuzycie zamiast 'magazynowania' "
+                f"po cenach, ktore normalnie bylyby drogie.\n")
+
     def run_planner(self, cfg, snap, price_ok, prices):
         if not price_ok:
             text, dt, n = self.run_advisor(cfg, snap)
@@ -296,7 +310,7 @@ class KospelLLM(hass.Hass):
             f"{r['t_local']}: {r['full']} zł/kWh" + (" [tanio]" if r["cheap"] else "") + (" [drogo]" if r["exp"] else "")
             for r in prices["curve"])
         user = ("Stan kotła:\n" + json.dumps(snap, ensure_ascii=False) +
-                "\n\nCeny zakupu energii (najbliższe godziny):\n" + curve +
+                "\n\nCeny zakupu energii (najbliższe godziny):\n" + curve + self.price_context(prices) +
                 "\n\nZaproponuj plan sterowania: w których godzinach grzać mocniej (wyższa moc / wcześniejsze "
                 "nagrzanie CO i CWU, magazynowanie ciepła w TANICH godzinach), a kiedy ograniczyć moc (DROGIE "
                 "godziny), utrzymując komfort ~21-22°C. Podaj 3-5 konkretnych kroków z godzinami i szacowany "
@@ -537,7 +551,7 @@ class KospelLLM(hass.Hass):
             user = (live_note + f"Zaprojektuj DZIENNY program {tt['key']} (max 5 przedzialow czasowych).\n"
                     "Poziomy: " + tt["levels"] + "\n" + tt["goal"] + "\n"
                     "Minuty od polnocy (0-1439), start_min < stop_min, rosnaco i bez nakladania.\n\n"
-                    "Ceny energii:\n" + curve + fc
+                    "Ceny energii:\n" + curve + self.price_context(prices) + fc
                     + (usage if tt["key"] in ("CWU", "Cyrkulacja") else ""))
             raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
                                           "You design heating schedules. Output ONLY JSON per schema.",
