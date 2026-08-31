@@ -159,6 +159,12 @@ All values little-endian **on the wire** (byte-swapped vs Modbus convention). Sl
 Some config registers only latch when the config word (`0x0B55`/`0x0B54`) is re-written in the
 same burst — the generator handles these "gated" writes.
 
+## Config flags & season
+
+The heater's season and subsystem-enable flags live in one word (`0x0B55`). There's a
+non-obvious ordering rule (enable the DHW tank *before* selecting summer) and a safe recovery
+procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
+
 ## Lessons learned (the expensive ones)
 
 - **ESPHome `http_request` polling can reset your API connection.** Periodic 0.5 s
@@ -171,6 +177,8 @@ same burst — the generator handles these "gated" writes.
   Home Assistant itself.
 - A boiler alarm sensor computed from a not-yet-read register briefly reads garbage after every
   reboot — guard NaN, and debounce watchdogs that act on it.
+- **Season needs the DHW tank enabled first** — writing summer while the tank is off silently
+  reverts (see docs/CONFIG-FLAGS.md). The heater owns `0x0B55`; enable preconditions, then season.
 
 ## License
 

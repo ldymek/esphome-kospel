@@ -168,6 +168,12 @@ Część rejestrów konfiguracyjnych zatrzaskuje się tylko, gdy słowo konfigur
 (`0x0B55`/`0x0B54`) zostanie ponownie zapisane w tej samej serii — generator obsługuje te
 „gated" zapisy.
 
+## Flagi konfiguracyjne i sezon
+
+Sezon i flagi włączające podsystemy siedzą w jednym słowie (`0x0B55`). Jest nieoczywista
+zasada kolejności (włącz zasobnik CWU *przed* wyborem trybu Lato) oraz bezpieczna procedura
+odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
+
 ## Lekcje (te drogie)
 
 - **Cykliczne odpytywanie `http_request` w ESPHome potrafi resetować połączenie API.**
