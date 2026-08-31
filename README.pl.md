@@ -32,9 +32,12 @@ z twardymi guardrailami.
   proponowane programy dzienne do nieużywanego **programu 8** kotła (tryb shadow) albo aktywnie
   przełącza na nie tydzień (**Autonomiczny**) z watchdogiem i automatycznym rollbackiem. Uczy się
   rytmu poboru ciepłej wody z detekcji spadków temperatury zasobnika — bez wodomierza.
-- **Limit mocy wg cen (opt-in)** — w drogich godzinach moc maksymalna kotła jest ograniczana
-  do 12 kW, w typowych 20 kW, w tanich pełne 24 kW; próg komfortu i dezynfekcja zawsze
-  wymuszają pełną moc; Twoje własne ustawienie wraca przy wyjściu z autonomii.
+- **Plan mocy wg cen (opt-in)** — kocioł nie ma natywnego harmonogramu mocy, więc AI wypycha
+  kroczący plan 24 h do ESP (drogie godziny 12 kW, typowe 20, tanie 24), a ESP wykonuje go
+  z lokalnymi guardami nawet przy leżącym HA: próg komfortu, zasobnik poniżej 35 °C (intensywny
+  pobór ciepłej wody w szczycie → pełna moc na odbudowę, potem znów limit) i dezynfekcja zawsze
+  wygrywają; przeterminowany plan (>26 h) bezpiecznie wraca do pełnej mocy; Twoje własne
+  ustawienie wraca przy wyjściu z autonomii.
 - **Stos energetyczno-kosztowy klasy rozliczeniowej** — rozdział mocy CO/CWU → liczniki kWh →
   sumy PLN po dokładnych cenach godzinowych (gotowe pod Energy Dashboard, statystyki trzymane
   bezterminowo).

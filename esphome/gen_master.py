@@ -23,6 +23,23 @@ api:
   encryption:
     key: !secret api_key
   actions:
+    # 24h max-power plan (idx 0..3 = 12/16/20/24 kW per LOCAL hour). enable=false stops steering
+    # (the user's manual setting then stays untouched).
+    - action: set_power_plan
+      variables:
+        plan: int[]
+        floor: float
+        cwu_min: float
+        enable: bool
+      then:
+        - lambda: |-
+            if (plan.size() < 24) return;
+            for (int h = 0; h < 24; h++) id(pwr_plan)[h] = plan[h];
+            id(pwr_floor) = floor;
+            id(pwr_cwu_min) = cwu_min;
+            id(pwr_enable) = enable;
+            id(pwr_last) = millis();
+            ESP_LOGI("pwrplan", "plan received (enable=%d floor=%.1f cwu_min=%.1f)", enable, floor, cwu_min);
     # Daily-program editor (parity with the C.MI timetable pages). Rewrites one program's 5 time
     # slots as the 15-reg block [s1,e1,..,s5,e5, i1..i5] at `base` (min-since-midnight; idx 1=ochrona
     # 2=komfort 3=komfort- 4=komfort+; 65535=slot pusty). Bases: CO 0x0C1C, CWU 0x0C9E, cyrk 0x0D20
@@ -124,6 +141,28 @@ globals:
   - id: wp_failed
     type: uint32_t[96]
     restore_value: no
+  # 24h power plan (max-power index 0..3 per local hour), pushed by the AI via the API service
+  # set_power_plan and executed HERE — heater has no native power schedule, and the plan must
+  # keep working with HA down (same philosophy as the TRV window failsafe).
+  - id: pwr_plan
+    type: int[24]
+    restore_value: no
+  - id: pwr_floor
+    type: float
+    restore_value: no
+    initial_value: '19'
+  - id: pwr_cwu_min
+    type: float
+    restore_value: no
+    initial_value: '35'
+  - id: pwr_enable
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: pwr_last
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   # TRV bridge (Fibaro rooms via r730-gpu:8901 <- zwave-js on the RPi) — HA-independent failsafe data
   - id: trv_okna
     type: int
@@ -1116,6 +1155,33 @@ out.append('''interval:
             rmw_season(false); id(trv_lato_flag) = false;
             ESP_LOGW("trv", "Failsafe: okna zamkniete -> Zima (CO wznowione)");
           }
+  # Power-plan executor: hourly max-power cap with LOCAL guards. Runs entirely on the ESP so it
+  # survives an HA outage. Guards force FULL power: room near the comfort floor, tank below
+  # cwu_min (heavy hot-water usage mid-peak -> recover, then re-cap), disinfection (>52C).
+  # Plan older than 26 h = stale -> one-time restore to full power and stop steering.
+  - interval: 300s
+    then:
+      - lambda: |-
+          if (!id(esp_owns_bus) || !id(pwr_enable)) return;
+          uint32_t now = millis();
+          bool stale = (id(pwr_last) == 0) || (now - id(pwr_last) > 93600000UL);
+          auto t = id(sntp_time).now();
+          int target = 3;
+          if (!stale && t.is_valid()) {
+            target = id(pwr_plan)[t.hour];
+            if (target < 0 || target > 3) target = 3;
+            float room = id(room_temp).state, dhw = id(dhw_temp).state;
+            if (!isnan(room) && room < id(pwr_floor) + 0.5f) target = 3;
+            if (!isnan(dhw) && dhw < id(pwr_cwu_min)) target = 3;
+            if (!isnan(dhw) && dhw > 52.0f) target = 3;
+          }
+          if (stale) { id(pwr_enable) = false; ESP_LOGW("pwrplan", "plan stale -> full power, steering off"); }
+          float curf = id(max_power_index_read).state;
+          if (!isnan(curf) && (int) curf == target) return;
+          uint16_t v = (uint16_t) target, wire = ((v & 0xFF) << 8) | (v >> 8);
+          id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+              id(heater), 0x0B62, 1, {wire}));
+          ESP_LOGI("pwrplan", "max power -> idx %d (hour %d)", target, t.is_valid() ? t.hour : -1);
   - interval: 10s
     then:
       - lambda: |-

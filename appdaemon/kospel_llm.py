@@ -455,6 +455,13 @@ class KospelLLM(hass.Hass):
     def disengage_autonomy(self, reason):
         a = self.load_auton()
         if not a.get("active"): return
+        # stop the ESP-side power steering; the backup loop below restores the user's index
+        try:
+            self.call_service("esphome/kc868_heater_set_power_plan",
+                              plan=[3] * 24, floor=0.0, cwu_min=0.0, enable=False)
+            self._pwr_sig = None
+        except Exception as e:
+            self.log(f"power plan disable err: {e}", level="WARNING")
         for key, v in (a.get("backup") or {}).items():
             self.call_service("number/set_value",
                               entity_id=f"number.kc868_heater_{key}", value=v)
@@ -512,35 +519,34 @@ class KospelLLM(hass.Hass):
             else:
                 self.power_cap_tick(room, floor)
 
-    # ---------- price-driven power cap (opt-in, autonomy only) ----------
-    # The schedules steer WHAT temperature to hold; this caps HOW HARD the heater may pull while
-    # doing it: expensive hour -> 12 kW, normal -> 20 kW, cheap -> 24 kW (indices 0/2/3).
-    # Full power is always restored when comfort is at risk or disinfection runs. The user's own
-    # setting is in the autonomy backup and returns on disengage.
+    # ---------- price-driven power plan (opt-in, autonomy only) ----------
+    # The heater has no native power schedule, so the AI PUSHES a rolling 24h plan (max-power
+    # index per local hour: expensive->12 kW, normal->20, cheap->24) into the ESP, which executes
+    # it with LOCAL guards (comfort floor, tank below cwu_min = heavy usage mid-peak, disinfection)
+    # — HA can be down and the plan keeps working. The user's own setting sits in the autonomy
+    # backup and returns on disengage.
     def power_cap_tick(self, room, floor):
-        if self.stt("input_boolean.kospel_ai_moc_auto") != "on": return
         prices = getattr(self, "last_prices", None)
-        if not prices or prices.get("now") is None: return
-        if self.stt("binary_sensor.kc868_heater_dezynfekcja_aktywna") == "on":
-            target = 3                       # anti-legionella needs full power
-        elif room is not None and room < floor + 0.5:
-            target = 3                       # comfort at risk beats savings
-        elif prices.get("exp_now"):
-            target = 0                       # 12 kW through the price peak
-        elif prices.get("cheap_now"):
-            target = 3                       # 24 kW to charge tank/building fast
-        else:
-            target = 2                       # 20 kW default
-        try: cur = int(float(self.stt("number.kc868_heater_heater_max_power_index")))
-        except (TypeError, ValueError): return
-        now = time.time()
-        if target == cur or now - getattr(self, "_pcap_last", 0) < 600: return
-        self._pcap_last = now
-        self.call_service("number/set_value",
-                          entity_id="number.kc868_heater_heater_max_power_index", value=target)
-        kw = {0: 12, 1: 16, 2: 20, 3: 24}
-        self.log(f"AUTONOMY: limit mocy {kw.get(cur,'?')} -> {kw[target]} kW "
-                 f"(cena {prices['now']} zł/kWh, exp={prices.get('exp_now')}, cheap={prices.get('cheap_now')})")
+        if not prices: return
+        enable = self.stt("input_boolean.kospel_ai_moc_auto") == "on"
+        plan, seen = [2] * 24, set()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for r in prices.get("all", []):
+            try: ts = datetime.datetime.fromisoformat(r["iso"].replace("Z", "+00:00"))
+            except Exception: continue
+            if ts + datetime.timedelta(hours=1) <= now: continue          # past hour
+            if ts - now > datetime.timedelta(hours=24): continue          # beyond the rolling day
+            h = ts.astimezone().hour
+            if h in seen: continue
+            seen.add(h)
+            plan[h] = 0 if r["exp"] else (3 if r["cheap"] else 2)
+        sig = (tuple(plan), round(floor, 1), enable)
+        if sig == getattr(self, "_pwr_sig", None) and time.time() - getattr(self, "_pwr_push", 0) < 6 * 3600:
+            return   # unchanged; ESP refreshes staleness from our 6h re-push
+        self._pwr_sig, self._pwr_push = sig, time.time()
+        self.call_service("esphome/kc868_heater_set_power_plan",
+                          plan=plan, floor=float(floor), cwu_min=35.0, enable=enable)
+        self.log(f"AUTONOMY: plan mocy -> ESP (enable={enable}): {plan}")
 
     # ---------- AI schedule proposal -> write to CO program 8 ----------
     AI_PROG_NR = 8
