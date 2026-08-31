@@ -40,6 +40,31 @@ api:
             id(pwr_enable) = enable;
             id(pwr_last) = millis();
             ESP_LOGI("pwrplan", "plan received (enable=%d floor=%.1f cwu_min=%.1f)", enable, floor, cwu_min);
+    # ---- diagnostic raw Modbus access (reverse-engineering aid; result in the 'Modbus peek'
+    # text sensor as "addr: v1 v2 ..." decimal, LE-decoded). USE WITH CARE — mb_write hits the
+    # live heater. dev 0 = heater, 1 = C.MG3.
+    - action: mb_read
+      variables:
+        addr: int
+        count: int
+        dev: int
+      then:
+        - lambda: |-
+            if (!id(esp_owns_bus)) return;
+            int n = count; if (n < 1) n = 1; if (n > 16) n = 16;
+            uint16_t a = (uint16_t) addr;
+            auto cb = [a](esphome::modbus::EntityType, uint16_t, std::span<const uint8_t> d) {
+              std::string s = str_sprintf("0x%04X:", a);
+              for (size_t i = 0; i + 1 < d.size(); i += 2)
+                s += str_sprintf(" %u", (unsigned)((d[i+1] << 8) | d[i]));
+              id(mb_peek).publish_state(s);
+              ESP_LOGI("mbpeek", "%s", s.c_str());
+            };
+            auto *c = (dev == 1) ? id(cmg3) : id(heater);
+            c->queue_command(esphome::modbus_controller::ModbusCommandItem::create_read_command(
+                c, esphome::modbus_controller::ModbusRegisterType::HOLDING, a, (uint8_t) n, cb));
+    # (mb_write intentionally removed — raw arbitrary writes are too dangerous; use the typed
+    #  controls, which validate + gate. mb_read stays for read-only reverse-engineering.)
     # Daily-program editor (parity with the C.MI timetable pages). Rewrites one program's 5 time
     # slots as the 15-reg block [s1,e1,..,s5,e5, i1..i5] at `base` (min-since-midnight; idx 1=ochrona
     # 2=komfort 3=komfort- 4=komfort+; 65535=slot pusty). Bases: CO 0x0C1C, CWU 0x0C9E, cyrk 0x0D20
@@ -375,6 +400,7 @@ TEXT_SENSORS=[
  ("wp_pending_text","Zapisy w toku"),
  ("wp_failed_text","Zapisy nieudane"),
  ("wifi_scan_result","Skan WiFi"),
+ ("mb_peek","Modbus peek"),
 ]
 # on_value C++ body per source sensor id -> publishes the friendly text (and mode select sync)
 TEXTHOOKS={
