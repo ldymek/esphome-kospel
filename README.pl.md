@@ -195,11 +195,7 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
   jako nazwane transakcje (mapowanie rejestrów po stronie serwera). ESP pokrywa już sezon +
   główne flagi włączające przez przełączniki RMW (patrz docs/CONFIG-FLAGS.md); dokończenie
   pozostałych „gated" grup to ostatnia luka parytetu.
-- **Miękki restart kotła** (C.MI „restart kotła" = `FLAG_RESET_MSK`). Rejestr Modbus nie jest
-  jeszcze zmapowany — C.MI rozwiązuje nazwę flagi po stronie serwera i nie widać jej w przechwytach.
-  Procedura odkrycia (celowa, restartuje kocioł raz): wgraj sniffer zapisów RS485, przekaż szynę
-  C.MI, wywołaj restart z C.MI, przechwyć ramkę zapisu, przenieś jako ESP `button`. Zostawione
-  niezmapowane zamiast zgadywania — błędny zapis do `0x0B55` raz wyłączył zasobnik CWU.
+
 
 ## Licencja
 

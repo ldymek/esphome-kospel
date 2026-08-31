@@ -72,3 +72,23 @@ guess the original value:
 You can, but it's fragile: the season bits won't take if their precondition is unmet, and you'd
 have to reconstruct all the other bits exactly. The per-bit RMW switches + the tank-before-summer
 order are the reliable path, and they're what the ESP firmware exposes as normal HA entities.
+
+## Discovering server-side flags (e.g. boiler restart)
+
+Some C.MI features (like **"restart kotła"** = `FLAG_RESET_MSK`) are symbolic flags the C.MI maps
+to a register *server-side* — the name never appears on the Modbus wire, so you can't grep for it.
+The safe way to map one is to **sniff the bus while the C.MI performs the action** (never guess a
+register):
+
+1. Flash the RS485 write-sniffer firmware (closes relays 5/6 so the C.MI masters the bus; the ESP
+   only listens).
+2. Trigger the action from the C.MI (here: system → *restart kotła*).
+3. The sniffer logs the single write frame. For restart it was:
+   ```
+   65 10 0B 53 00 01 02 01 00      ->  write 1 to register 0x0B53 (func 0x10)
+   ```
+   (one-shot, distinct from the repeating `0x0BAE` heartbeat).
+4. Reflash the master firmware and expose it — here as the **"Restart kotła (MSK)"** button, which
+   writes `0x0B53 = 1`.
+
+So **boiler soft-restart is now ported** (`button.kc868_heater_restart_kotla_msk`).

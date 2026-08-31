@@ -1055,6 +1055,20 @@ for i in range(1,6):
 _SLOTS='esphome::text::Text* slots[5]={id(sched_slot1),id(sched_slot2),id(sched_slot3),id(sched_slot4),id(sched_slot5)};'
 _LVLS='esphome::select::Select* lvls[5]={id(sched_lvl1),id(sched_lvl2),id(sched_lvl3),id(sched_lvl4),id(sched_lvl5)};'
 out.append('''button:
+  # Soft heater restart — C.MI "restart kotła" = FLAG_RESET_MSK. Captured on the wire as a
+  # single write of 1 to 0x0B53 (65 10 0B 53 00 01 02 01 00). Reboots the MSK controller (~30 s).
+  - platform: template
+    name: "Restart kotła (MSK)"
+    id: heater_restart_btn
+    icon: mdi:restart-alert
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(esp_owns_bus)) return;
+          uint16_t wire = ((1 & 0xFF) << 8) | (1 >> 8);   // 0x0100 = LE(1), matches capture
+          id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+              id(heater), 0x0B53, 1, {wire}));
+          ESP_LOGW("restart", "FLAG_RESET_MSK -> 0x0B53=1 (soft heater reboot)");
   # On-demand WiFi site survey: blocking all-channel scan (~2 s loop stall, diagnostic use),
   # full list to the log at INFO, compact strongest-first summary into the "Skan WiFi" sensor.
   - platform: template

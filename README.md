@@ -189,12 +189,7 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
   as named transactions (server-side register mapping). The ESP already covers season + the main
   enable flags via per-bit RMW switches (see docs/CONFIG-FLAGS.md); porting the *remaining* gated
   config groups (buffer/OPERATING_MODE, DHW int/ext with supply temp) is the last parity gap.
-- **Boiler soft-restart** (C.MI "restart kotła" = `FLAG_RESET_MSK`). The Modbus register is not
-  yet mapped — the C.MI resolves the flag name server-side and it is never emitted in captures.
-  Discovery procedure (deliberate, reboots the heater once): flash the RS485 write-sniffer, hand
-  the bus to the C.MI, trigger the reset from the C.MI, capture the single write frame, port it as
-  an ESP `button`. Left unmapped rather than guessed — a wrong write to `0x0B55` once disabled the
-  DHW tank (see docs/CONFIG-FLAGS.md), so unknown registers are never written blind.
+
 
 ## License
 
