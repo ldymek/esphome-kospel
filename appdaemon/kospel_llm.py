@@ -541,8 +541,8 @@ class KospelLLM(hass.Hass):
             seen.add(h)
             plan[h] = 0 if r["exp"] else (3 if r["cheap"] else 2)
         sig = (tuple(plan), round(floor, 1), enable)
-        if sig == getattr(self, "_pwr_sig", None) and time.time() - getattr(self, "_pwr_push", 0) < 6 * 3600:
-            return   # unchanged; ESP refreshes staleness from our 6h re-push
+        if sig == getattr(self, "_pwr_sig", None) and time.time() - getattr(self, "_pwr_push", 0) < 900:
+            return   # 15-min re-push heartbeat: an ESP reboot wipes the plan (globals not restored)
         self._pwr_sig, self._pwr_push = sig, time.time()
         self.call_service("esphome/kc868_heater_set_power_plan",
                           plan=plan, floor=float(floor), cwu_min=35.0, enable=enable)
@@ -732,14 +732,24 @@ class KospelLLM(hass.Hass):
             self.dhw_last_publish = now
             top = sorted(range(24), key=lambda h: -(u["profile"][h] + u["today"][h]))[:5]
             top = [f"{h:02d}:00" for h in top if u["profile"][h] + u["today"][h] > 0]
-            # NB: state as string — AppDaemon drops falsy state values (int 0 -> HTTP 400 "No state")
+            # AppDaemon/HA mangle plain list attributes (strips zeros), so publish readable strings
+            # as the dashboard source and keep the raw arrays as CSV strings (round-trip safe).
+            def bars(arr, scale):
+                blk = "▁▂▃▄▅▆▇█"
+                mx = max(arr) or 1
+                return "".join(blk[min(7, int(v / mx * 7))] if v > 0 else "·" for v in arr)
+            def hourly(arr, fmt="{:.0f}"):
+                return "  ".join(f"{h:02d}:00→{fmt.format(v)}" for h, v in enumerate(arr) if v)
             self.set_state("sensor.kospel_cwu_profil", state=str(sum(u["today"])),
                            attributes={"friendly_name": "Profil poboru CWU (bez licznika)",
                                        "icon": "mdi:chart-bar", "unit_of_measurement": "min",
-                                       "dzis_minuty_wg_godzin": u["today"],
-                                       "profil_dlugoterminowy": u["profile"],
-                                       "profil_wg_dnia_tygodnia": u["by_dow"],
-                                       "najczestsze_godziny": top,
+                                       "najczestsze_godziny": ", ".join(top) or "—",
+                                       "dzis_wykres": bars(u["today"], 1),
+                                       "dzis_godziny": hourly(u["today"]) or "brak poboru",
+                                       "profil_wykres": bars(u["profile"], 1),
+                                       "profil_godziny": hourly(u["profile"], "{:.1f}") or "—",
+                                       "dzis_csv": ",".join(str(v) for v in u["today"]),
+                                       "profil_csv": ",".join(f"{v:.1f}" for v in u["profile"]),
                                        "metoda": "spadek temp. zasobnika >1.2°C/10 min bez grzania CWU"})
             self.dhw_drift_check(u)
 
