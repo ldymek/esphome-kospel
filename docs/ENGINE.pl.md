@@ -58,6 +58,27 @@ Cyrk: 06:00-08:00 · 17:00-21:00
 ma „przejechać” na bezwładności). Plany są walidowane (`validate_slots`) przed jakimkolwiek zapisem:
 przedziały muszą być uporządkowane, nienachodzące, ≤5 na program i z poprawnymi poziomami.
 
+## Twarde reguły (stosowane do każdego planera)
+
+Lekcja z 2026-09-01: LLM zostawił harmonogram CWU pusty (nastawa ekonomiczna) przez szczyt cenowy
+17–22 i jednocześnie otworzył 5-godzinne okno cyrkulacji. Krążenie chłodzi zasobnik ok. 3 K/h, więc
+kocioł dogrzewał go co godzinę po 1,5–1,7 zł/kWh. Od tego czasu `kospel_engine.enforce_rules()`
+przechodzi po wyniku aktywnego planera (LLM, silnik albo poprawka LLM) przed jakimkolwiek zapisem,
+a te same reguły trafiają do promptu LLM razem z dzisiejszymi godzinami drogimi/tanimi (`rules_hint`):
+
+| Reguła | Oszczędność | Balans | Komfort |
+|---|---|---|---|
+| Poziom CWU w godzinach drogich | Ochrona | Ochrona | ekonomiczny (bez zmian) |
+| Ładowanie zasobnika przed drogim blokiem | ostatnia tania godzina przed nim | tak samo | tak samo |
+| Cyrkulacja na klaster poboru | 1 h | 2 h | 3 h |
+| Cyrkulacja w godzinach drogich (łącznie) | 1 h | 1 h | 2 h |
+| Cyrkulacja na dobę (łącznie) | 3 h | 4 h | 5 h |
+
+Przy skracaniu cyrkulacji zostają godziny o najsilniejszym zaobserwowanym poborze. Ładowanie Komfort,
+które planer umieścił *w* szczycie, zostaje tylko wtedy, gdy jest jedynym ładowaniem w planie.
+Korekty są logowane i publikowane w atrybucie `korekty_regul` sensora harmonogramu, a atrybut
+`zrodlo` dostaje dopisek „+ reguły", żeby było widać, że strażnik zadziałał.
+
 ## Weryfikacja hybrydowa
 
 W trybie *Hybryda* LLM dostaje plan silnika plus ceny, prognozę, klastry poboru i stan modeli, i musi

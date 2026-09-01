@@ -160,10 +160,17 @@ class TankModel:
 PREF = {   # idle = outside comfort windows (None -> heater economic setpoint, costs no slot);
            # peak = expensive hour inside a comfort window when the building can NOT coast;
            # tiers = power-plan index (exp, normal, cheap); tmin_off = tolerated drop below setpoint
-    "Oszczędność": {"idle": None, "peak": OCHRONA, "tiers": (0, 1, 3), "tmin_off": 1.5},
-    "Balans":      {"idle": None, "peak": KOMFORT_MINUS, "tiers": (0, 2, 3), "tmin_off": 1.0},
-    "Komfort":     {"idle": KOMFORT_MINUS, "peak": KOMFORT, "tiers": (2, 3, 3), "tmin_off": 0.5},
+    "Oszczędność": {"idle": None, "peak": OCHRONA, "tiers": (0, 1, 3), "tmin_off": 1.5,
+                    "cwu_peak": OCHRONA, "circ_per_cluster": 1, "circ_exp_cap_h": 1, "circ_day_cap_h": 3},
+    "Balans":      {"idle": None, "peak": KOMFORT_MINUS, "tiers": (0, 2, 3), "tmin_off": 1.0,
+                    "cwu_peak": OCHRONA, "circ_per_cluster": 2, "circ_exp_cap_h": 1, "circ_day_cap_h": 4},
+    "Komfort":     {"idle": KOMFORT_MINUS, "peak": KOMFORT, "tiers": (2, 3, 3), "tmin_off": 0.5,
+                    "cwu_peak": None, "circ_per_cluster": 3, "circ_exp_cap_h": 2, "circ_day_cap_h": 5},
 }
+# Lesson 2026-09-01: a blank (economic) CWU level through the 17-22 price peak plus a 5 h circulation
+# window made the heater top the tank up every hour at 1.5-1.7 zl/kWh (circulation drains ~3 K/h).
+# Hard rules below: expensive hours -> CWU Ochrona (tank charged in the last cheap hour before the
+# block), circulation only on the strongest draw hours, capped per cluster / in the peak / per day.
 DEFAULT_COMFORT_WINDOWS = [(6, 9), (16, 22)]
 
 def _compress(levels_by_hour, max_slots=5):
@@ -194,6 +201,85 @@ def _compress(levels_by_hour, max_slots=5):
                 slots[k] = (slots[k][0], slots[k + 1][1], slots[k][2]); del slots[k + 1]
             else: k += 1
     return [(s, min(e, 1439), lv) for s, e, lv in slots]
+
+def _compress_q(levels_q, max_slots=5, qmin=15):
+    """Like _compress but on fixed buckets of `qmin` minutes (96 quarters for a day)."""
+    slots = []
+    for i, lv in enumerate(levels_q):
+        if lv is None: continue
+        a, b = i * qmin, (i + 1) * qmin
+        if slots and slots[-1][2] == lv and slots[-1][1] == a: slots[-1] = (slots[-1][0], b, lv)
+        else: slots.append((a, b, lv))
+    while len(slots) > max_slots:
+        i = min(range(len(slots)), key=lambda k: slots[k][1] - slots[k][0])
+        s = slots[i]
+        if s[2] in (OCHRONA, KOMFORT_MINUS): del slots[i]; continue
+        nb = [k for k in (i - 1, i + 1) if 0 <= k < len(slots)]
+        j = max(nb, key=lambda k: slots[k][1] - slots[k][0])
+        a, b = sorted([slots[i], slots[j]])
+        slots[min(i, j)] = (a[0], b[1], slots[j][2]); del slots[max(i, j)]
+        k = 0
+        while k + 1 < len(slots):
+            if slots[k][2] == slots[k + 1][2] and slots[k][1] == slots[k + 1][0]:
+                slots[k] = (slots[k][0], slots[k + 1][1], slots[k][2]); del slots[k + 1]
+            else: k += 1
+    return [(s, min(e, 1439), lv) for s, e, lv in slots]
+
+def _to_quarters(slots):
+    q = [None] * 96
+    for a, b, lv in slots:
+        for i in range(max(0, a // 15), min(96, (b + 14) // 15)): q[i] = lv
+    return q
+
+def enforce_rules(key, slots, hours, pref="Balans", usage=None):
+    """Programmatic guard applied to ANY planner's output (LLM, engine, hybrid amendment) before it
+    is written to the heater. Returns (slots, notes). Rules (by preference):
+    CWU  - expensive hours are Ochrona (no hourly top-ups in the price peak); a Komfort charge that
+           the planner put INSIDE an expensive hour is kept only if it is the plan's only charge.
+    Cyrk - circulation in expensive hours capped (circ_exp_cap_h), whole day capped (circ_day_cap_h);
+           when trimming, the hours with the strongest observed draws are kept."""
+    P = PREF.get(pref, PREF["Balans"])
+    notes = []
+    if not slots or key not in ("CWU", "Cyrkulacja"): return slots, notes
+    def exp(h): return bool((hours[h] or {}).get("exp")) if hours and h < len(hours) else False
+    exp_hours = [h for h in range(24) if exp(h)]
+    if not exp_hours: return slots, notes
+    q = _to_quarters(slots)
+    if key == "CWU" and P["cwu_peak"] is not None:
+        komf_all = [i for i in range(96) if q[i] in (KOMFORT, KOMFORT_PLUS)]
+        komf_exp = [i for i in komf_all if exp(i // 4)]
+        changed = []
+        for i in range(96):
+            h = i // 4
+            if not exp(h): continue
+            if q[i] in (KOMFORT, KOMFORT_PLUS) and len(komf_exp) == len(komf_all): continue  # only charge -> keep
+            if q[i] != P["cwu_peak"]:
+                q[i] = P["cwu_peak"]; changed.append(h)
+        if changed:
+            hs = sorted(set(changed))
+            notes.append(f"CWU: godziny drogie {hs[0]:02d}-{hs[-1]+1:02d} -> {LEVEL_NAME[P['cwu_peak']]} (bez dogrzewań w szczycie cen)")
+        return _compress_q(q, 5), notes
+    if key == "Cyrkulacja":
+        on = [i for i in range(96) if q[i] is not None]
+        if not on: return slots, notes
+        def weight(i):  # prefer quarters in hours with observed draws
+            return (usage[i // 4] if usage and i // 4 < len(usage) else 0.0)
+        on_exp = [i for i in on if exp(i // 4)]
+        cap_exp = int(P["circ_exp_cap_h"] * 4)
+        if len(on_exp) > cap_exp:
+            keep = set(sorted(on_exp, key=lambda i: (-weight(i), i))[:cap_exp])
+            for i in on_exp:
+                if i not in keep: q[i] = None
+            notes.append(f"Cyrkulacja: w drogich godzinach skrócona z {len(on_exp)/4:g} h do {cap_exp/4:g} h (krążenie chłodzi zasobnik ~3 K/h)")
+        on = [i for i in range(96) if q[i] is not None]
+        cap_day = int(P["circ_day_cap_h"] * 4)
+        if len(on) > cap_day:
+            keep = set(sorted(on, key=lambda i: (-weight(i), i))[:cap_day])
+            for i in on:
+                if i not in keep: q[i] = None
+            notes.append(f"Cyrkulacja: łącznie skrócona do {cap_day/4:g} h/dobę")
+        return _compress_q(q, 4), notes
+    return slots, notes
 
 def human(slots):
     return [f"{a//60:02d}:{a%60:02d}-{b//60:02d}:{b%60:02d} {LEVEL_NAME[l]}" for a, b, l in slots]
@@ -281,6 +367,23 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
     else:
         for h in (6, 17): cwu[h] = KOMFORT
         notes.append("CWU: brak profilu poboru -> domyślne 06:00 i 17:00")
+    # expensive hours: Ochrona instead of the economic setpoint (no hourly top-ups in the peak);
+    # make sure a Komfort charge sits in the last non-expensive hours before each peak block that
+    # overlaps (or is followed within 2 h by) a draw cluster.
+    if P["cwu_peak"] is not None and not away:
+        for h in range(24):
+            if exp(h) and (h == 0 or not exp(h - 1)):
+                blk = 1
+                while h + blk < 24 and exp(h + blk): blk += 1
+                uses = any(hs <= h + blk + 1 and he >= h for hs, he in cl) if cl else True
+                pre_win = [k for k in range(max(0, h - 4), h) if not exp(k)]
+                if uses and pre_win and not any(cwu[k] == KOMFORT for k in pre_win):
+                    best = min(pre_win, key=lambda k: (price(k) if price(k) is not None else 9) + 0.03 * (h - 1 - k))
+                    cwu[best] = KOMFORT
+                    notes.append(f"CWU: ładowanie o {best:02d}:00 przed drogim blokiem {h:02d}-{h+blk:02d}" + (f" ({price(best)} zł/kWh)" if price(best) is not None else ""))
+        exp_set = [h for h in range(24) if exp(h) and cwu[h] is None]
+        for h in exp_set: cwu[h] = P["cwu_peak"]
+        if exp_set: notes.append(f"CWU: w drogich godzinach poziom {LEVEL_NAME[P['cwu_peak']]} — zasobnik pracuje na zapasie, bez dogrzewań w szczycie")
     battery_hour = None
     if battery and known:
         hb = min(known, key=lambda h: price(h))
@@ -296,10 +399,18 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
     if not away:
         if cl:
             for hs, he in cl:
-                for k in range(hs, min(24, he + 1)): circ[k] = KOMFORT
-            notes.append("Cyrkulacja tylko w godzinach realnego poboru.")
+                hrs = list(range(hs, min(24, he + 1)))
+                n_exp = sum(1 for k in hrs if exp(k))
+                cap = P["circ_per_cluster"] if n_exp == 0 else min(P["circ_per_cluster"], P["circ_exp_cap_h"])
+                top = sorted(hrs, key=lambda k: (-(usage[k] if k < len(usage) else 0), k))[:cap]
+                for k in top: circ[k] = KOMFORT
+            while sum(1 for k in range(24) if circ[k]) > P["circ_day_cap_h"]:   # whole-day cap
+                weakest = min((k for k in range(24) if circ[k]), key=lambda k: (usage[k] if k < len(usage) else 0, -k))
+                circ[weakest] = None
+            tot = sum(1 for k in range(24) if circ[k])
+            notes.append(f"Cyrkulacja: {tot} h/dobę tylko w godzinach najsilniejszego poboru (krążenie chłodzi zasobnik ~3 K/h" + (", w drogich godzinach max %g h)" % P["circ_exp_cap_h"] if any(exp(k) for k in range(24)) else ")"))
         else:
-            for k in list(range(6, 9)) + list(range(17, 23)): circ[k] = KOMFORT
+            for k in (6, 7, 18, 19): circ[k] = KOMFORT
     circ_slots = _compress(circ, max_slots=4)
 
     # ---- power plan ----

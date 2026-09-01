@@ -57,6 +57,28 @@ Cyrk: 06:00-08:00 · 17:00-21:00
 house is expected to coast through). Plans are validated (`validate_slots`) before any write: slots
 must be ordered, non-overlapping, ≤5 per program and use valid levels.
 
+## Hard rules (applied to every planner)
+
+Learned the expensive way on 2026-09-01: the LLM left the CWU timetable blank (economic setpoint)
+through the 17–22 price peak and opened a 5-hour circulation window at the same time. Circulation
+drains the tank at roughly 3 K/h, so the heater topped it up every hour at 1.5–1.7 PLN/kWh. Since
+then `kospel_engine.enforce_rules()` runs on whatever the active planner produced (LLM, engine or an
+LLM amendment) before anything is written, and the same rules are spelled out in the LLM prompt with
+today's actual expensive/cheap hours (`rules_hint`):
+
+| Rule | Oszczędność | Balans | Komfort |
+|---|---|---|---|
+| CWU level in expensive hours | Ochrona | Ochrona | economic (unchanged) |
+| Tank charge before a peak block | last cheap hour before it | same | same |
+| Circulation per draw cluster | 1 h | 2 h | 3 h |
+| Circulation inside expensive hours (total) | 1 h | 1 h | 2 h |
+| Circulation per day (total) | 3 h | 4 h | 5 h |
+
+When trimming circulation the hours with the strongest observed draws are kept. A Komfort charge the
+planner placed *inside* a peak is kept only if it is the plan's only charge. Corrections are logged
+and published in the schedule sensor attribute `korekty_regul`, and the `zrodlo` attribute gets a
+"+ reguły" suffix so you can see the guard acted.
+
 ## Hybrid verification
 
 In *Hybryda* the LLM gets the engine plan plus prices, forecast, usage clusters and model state, and

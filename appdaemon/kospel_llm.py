@@ -575,15 +575,17 @@ class KospelLLM(hass.Hass):
                   "godzinach; Ochrona (1) w NAJDROZSZYCH i w nocy.")},
         {"key": "CWU", "base": 3230, "sensor": "sensor.kospel_ai_harmonogram_cwu",
          "levels": "dla cieplej wody (CWU): 2=grzej zasobnik do komfortu, 1=ekonomicznie (podtrzymanie)",
-         "goal": ("Nagrzej zasobnik CWU (2) w 2-3 NAJTANSZYCH godzinach doby oraz tuz przed porannym (~6:00) "
-                  "i wieczornym (~18:00) uzyciem; reszta doby ekonomicznie (1).")},
+         "goal": ("Nagrzej zasobnik CWU (2) w 1-2 tanich godzinach TUZ PRZED kazdym klastrem poboru (rano ~6:00, "
+                  "wieczor) — a przed drogim blokiem cenowym w OSTATNIEJ taniej godzinie przed nim. "
+                  "W GODZINACH DROGICH zawsze poziom 1 (Ochrona): zasobnik pracuje na zapasie, kociol NIE dogrzewa "
+                  "w szczycie cen. Poza przedzialami = ekonomicznie (podtrzymanie) — tylko w godzinach tanich/srednich.")},
         {"key": "Cyrkulacja", "base": 3360, "sensor": "sensor.kospel_ai_harmonogram_cyrk",
          "levels": ("dla pompy CYRKULACJI CWU: w przedziale pompa krazy (ciepla woda od reki w lazience), "
                     "poza przedzialami stoi (zero strat ciepla w rurach). Poziom zawsze 2."),
-         "goal": ("Wybierz 2-4 KROTKIE okna krazenia tylko gdy domownicy realnie uzywaja cieplej wody: "
-                  "rano ~5:45-8:30 i wieczorem ~17:30-22:30 (ew. krotko w poludnie). NIGDY w nocy ani gdy "
-                  "dom pusty — kazda godzina krazenia to realne straty ciepla z rur, ktore kociol musi "
-                  "doplacic. Okna zgraj z harmonogramem CWU tak, by zasobnik byl juz nagrzany.")},
+         "goal": ("Wybierz 2-4 KROTKIE okna krazenia (kazde 30-90 min, LACZNIE max 4 h/dobe) tylko w godzinach "
+                  "NAJSILNIEJSZEGO realnego poboru wg profilu (rano, wieczor). Krazenie chlodzi zasobnik ~3 K/h, "
+                  "wiec w GODZINACH DROGICH lacznie max 1 h. NIGDY w nocy ani gdy dom pusty. "
+                  "Okna zgraj z harmonogramem CWU tak, by zasobnik byl juz nagrzany.")},
     ]
 
     # ================= PLANNER MODES: LLM / Silnik / Hybryda =================
@@ -671,6 +673,27 @@ class KospelLLM(hass.Hass):
         if verify is not None: attrs["weryfikacja_llm"] = verify
         self.set_state("sensor.kospel_plan_silnika", state=time.strftime("%Y-%m-%d %H:%M"), attributes=attrs)
 
+    def rules_hint(self, prices):
+        """Explicit, price-specific hard rules for the LLM (mirrors eng.enforce_rules)."""
+        hours = self.hours_from_prices(prices)
+        exp_h = [h for h in range(24) if hours[h] and hours[h]["exp"]]
+        cheap_h = [h for h in range(24) if hours[h] and hours[h]["cheap"]]
+        P = eng.PREF.get(self.prefs()["pref"], eng.PREF["Balans"])
+        def spans(hs):
+            out, s = [], None
+            for h in range(25):
+                if h < 24 and h in hs and s is None: s = h
+                elif (h == 24 or h not in hs) and s is not None: out.append(f"{s:02d}:00-{h:02d}:00"); s = None
+            return ", ".join(out) or "brak"
+        txt = f"\n\nTWARDE REGULY (preferencja {self.prefs()['pref']}):\n- Godziny DROGIE dzis: {spans(exp_h)}. Godziny TANIE: {spans(cheap_h)}.\n"
+        if P["cwu_peak"] is not None:
+            txt += (f"- CWU: w godzinach drogich poziom 1 (Ochrona). Nagrzej zasobnik (2) w ostatniej taniej/sredniej godzinie "
+                    f"przed kazdym drogim blokiem oraz 1 h przed porannym poborem. Zaden poziom 2 w godzinach drogich.\n")
+        txt += (f"- Cyrkulacja: lacznie max {P['circ_day_cap_h']} h/dobe, w godzinach drogich max {P['circ_exp_cap_h']} h; "
+                "tylko godziny najsilniejszego poboru z profilu.\n"
+                "- Program, ktory lamie te reguly, zostanie automatycznie skorygowany.")
+        return txt
+
     def context_hint(self):
         pr = self.prefs(); parts = []
         if any(abs(b) > 0.5 for b in pr["bias"]):
@@ -703,7 +726,7 @@ class KospelLLM(hass.Hass):
                     "Poziomy: " + tt["levels"] + "\n" + tt["goal"] + "\n"
                     "Minuty od polnocy (0-1439), start_min < stop_min, rosnaco i bez nakladania.\n\n"
                     "Ceny energii:\n" + curve + self.price_context(prices) + fc + ctx
-                    + (usage if tt["key"] in ("CWU", "Cyrkulacja") else ""))
+                    + (usage + self.rules_hint(prices) if tt["key"] in ("CWU", "Cyrkulacja") else ""))
             raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
                                           "You design heating schedules. Output ONLY JSON per schema.",
                                           user, schema=self.SLOT_SCHEMA, thinking=False, temp=0.1, npredict=400)
@@ -729,7 +752,8 @@ class KospelLLM(hass.Hass):
                           + (" DROGO" if r["exp"] else "") for r in prices["curve"])
         fc = ("\nPrognoza pogody:\n" + "\n".join(forecast)) if forecast else ""
         user = ("Silnik deterministyczny zaproponowal programy dzienne kotla. Zweryfikuj je jako ekspert: "
-                "czy sa bezpieczne (komfort, brak grzania w drogich godzinach bez potrzeby, CWU przed poborem), "
+                "czy sa bezpieczne (komfort, brak grzania w drogich godzinach bez potrzeby, CWU naladowane PRZED drogim "
+                "blokiem i na Ochronie W drogim bloku, cyrkulacja krotka i tylko przy realnym poborze), "
                 "spojne z cenami i pogoda. Jesli plan jest dobry -> zatwierdzam=true, uwagi krotkie. "
                 "Jesli widzisz KONKRETNY blad, podaj poprawiony program w 'poprawki' (tylko dla tej tabeli, "
                 "max 5 przedzialow, minuty 0-1439, poziomy 1=Ochrona 2=Komfort 3=Komfort- 4=Komfort+). "
@@ -737,7 +761,8 @@ class KospelLLM(hass.Hass):
                 f"PLAN SILNIKA (preferencja {out.get('pref')}, nikogo w domu={out.get('away')}):\n"
                 f"CO: {eng.human(out['CO'])}\nCWU: {eng.human(out['CWU'])}\nCyrkulacja: {eng.human(out['Cyrkulacja'])}\n"
                 "Uzasadnienie silnika:\n- " + "\n- ".join(out.get("rationale", [])) + "\n\n"
-                "Ceny energii:\n" + curve + self.price_context(prices) + fc + self.dhw_usage_hint() + self.context_hint())
+                "Ceny energii:\n" + curve + self.price_context(prices) + fc + self.dhw_usage_hint() + self.context_hint()
+                + self.rules_hint(prices))
         try:
             raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
                                           "You audit heating schedules. Output ONLY JSON per schema.",
@@ -756,7 +781,7 @@ class KospelLLM(hass.Hass):
         self.log(f"hybrid verify: {verify}")
         return verify, adj
 
-    def write_plans(self, plans, source, live):
+    def write_plans(self, plans, source, live, fixes=None):
         lvl = {1: "Ochrona", 2: "Komfort", 3: "Komfort-", 4: "Komfort+"}
         out = {}
         for tt in self.TIMETABLES:
@@ -775,6 +800,7 @@ class KospelLLM(hass.Hass):
                            attributes={"friendly_name": f"Program AI {tt['key']} (8)",
                                        "icon": "mdi:calendar-star", "przedzialy": human,
                                        "zrodlo": source.get(tt["key"], "?"),
+                                       "korekty_regul": (fixes or {}).get(tt["key"], []),
                                        "zapisano_do": f"{tt['key']} program {self.AI_PROG_NR} ({status_txt})",
                                        "aktywacja": ("steruje kotłem (Autonomiczny)" if live else
                                                      f"ustaw dzień na 8 w Programy {tt['key']} lub tryb Autonomiczny")})
@@ -808,7 +834,16 @@ class KospelLLM(hass.Hass):
                     source[k] = "Hybryda: silnik (LLM zatwierdził)" if verify.get("zatwierdzam") else "Hybryda: silnik (uwagi LLM)"
         else:
             plans = self.llm_plans(cfg, prices, forecast, live); source = {k: "LLM" for k in plans}
-        return self.write_plans(plans, source, live)
+        # programmatic guard (same rules for LLM / Silnik / Hybryda output)
+        hours = self.hours_from_prices(prices); pr = self.prefs()
+        u = self.dhw_load(); usage = [round(p + t_, 1) for p, t_ in zip(u["profile"], u["today"])]
+        fixes = {}
+        for k in list(plans.keys()):
+            fixed, notes = eng.enforce_rules(k, plans[k], hours, pr["pref"], usage)
+            if notes:
+                plans[k] = fixed; fixes[k] = notes; source[k] = source.get(k, "?") + " + reguły"
+                self.log(f"rules[{k}]: {notes} -> {eng.human(fixed)}")
+        return self.write_plans(plans, source, live, fixes)
 
     # ================= models / learning / analytics =================
     def fetch_series(self, eid, hours):
