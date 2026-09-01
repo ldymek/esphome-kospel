@@ -6,6 +6,16 @@ input_select:
     options: ["Doradca (tylko opis)", "Propozycje (shadow)", "Autonomiczny"]
     initial: "Doradca (tylko opis)"
     icon: mdi:robot
+  kospel_planer:
+    name: "AI — planer"
+    options: ["LLM", "Silnik", "Hybryda (silnik + weryfikacja LLM)"]
+    initial: "LLM"
+    icon: mdi:engine
+  kospel_preferencja:
+    name: "AI — preferencja"
+    options: ["Oszczędność", "Balans", "Komfort"]
+    initial: "Balans"
+    icon: mdi:scale-balance
   kospel_llm_model:
     name: "AI — model (Ollama)"
     options: ["gemma4:26b-a4b-it-qat", "qwen3:30b", "llama4:8b"]   # EDIT ME: models you host
@@ -27,6 +37,12 @@ input_boolean:
   kospel_ai_moc_auto:
     name: "AI — limit mocy wg cen"
     icon: mdi:speedometer-slow
+  kospel_zawor_mieszajacy:
+    name: "CWU — zawór mieszający (magazyn ciepła)"
+    icon: mdi:water-thermometer
+  kospel_backtest_run:
+    name: "AI — uruchom backtest"
+    icon: mdi:history
 
 input_number:
   kospel_llm_interwal_h:
@@ -48,6 +64,20 @@ input_number:
     max: 1
     step: 0.05
     initial: 0.2
+  kospel_cwu_magazyn_temp:
+    name: "CWU — temp. magazynu ciepła"
+    min: 45
+    max: 65
+    step: 1
+    initial: 60
+    unit_of_measurement: "°C"
+  kospel_taryfa_plaska:
+    name: "Taryfa płaska (porównanie)"
+    min: 0.3
+    max: 3.0
+    step: 0.01
+    initial: 1.10
+    unit_of_measurement: "PLN/kWh"
   kospel_okna_prog:
     name: "Wietrzenie — próg otwartych okien"
     min: 1

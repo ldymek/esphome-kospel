@@ -10,3 +10,7 @@ kospel_llm:
   class: KospelLLM
   ollama_host: http://192.168.1.21:11434     # EDIT ME
   pstryk_api_key: !secret pstryk_api_key     # or leave out and use the UI field / key file
+  # presence -> eco planning when everyone is away >30 min (default: all person.* you list here)
+  persons: [person.you, person.partner]
+  # optional: calendar whose 'urlop'/'wakacje' events force eco mode
+  # calendar: calendar.family

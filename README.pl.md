@@ -32,6 +32,13 @@ z twardymi guardrailami.
   proponowane programy dzienne do nieużywanego **programu 8** kotła (tryb shadow) albo aktywnie
   przełącza na nie tydzień (**Autonomiczny**) z watchdogiem i automatycznym rollbackiem. Uczy się
   rytmu poboru ciepłej wody z detekcji spadków temperatury zasobnika — bez wodomierza.
+- **Dwa planery do wyboru (v2)** — `input_select.kospel_planer`: **LLM** (model językowy projektuje
+  programy), **Silnik** (silnik deterministyczny: dopasowany model termiczny domu + model zasobnika +
+  klastry poboru ciepłej wody + ceny, bez GPU) albo **Hybryda** (silnik planuje, LLM audytuje i może
+  poprawić). Plan silnika jest zawsze publikowany do porównania. Suwak preferencji (Oszczędność /
+  Balans / Komfort), tryb eco wg obecności, przyciski „za zimno / za ciepło", dzienne oszczędności vs
+  taryfa płaska, podsumowanie tygodnia, diagnostyka ciśnienia i degradacji zasobnika oraz backtest
+  jednym kliknięciem — patrz [docs/ENGINE.pl.md](docs/ENGINE.pl.md).
 - **Plan mocy wg cen (opt-in)** — kocioł nie ma natywnego harmonogramu mocy, więc AI wypycha
   kroczący plan 24 h do ESP (drogie godziny 12 kW, typowe 20, tanie 24), a ESP wykonuje go
   z lokalnymi guardami nawet przy leżącym HA: próg komfortu, zasobnik poniżej 35 °C (intensywny
@@ -189,6 +196,7 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 
 ## Roadmapa
 
+- ~~Silnik planowania + weryfikacja hybrydowa LLM, oszczędności i diagnostyka~~ — dostarczone w v2 (docs/ENGINE.pl.md).
 - **Własna integracja Home Assistant** (`custom_components/`) z config-flow — projekt jako
   prawdziwa integracja HA (host Ollama, klucz Pstryk itd.) zamiast AppDaemon + helpery.
 - **Warstwa symbolicznego zapisu flag** — C.MI zapisuje flagi (np. `FLAG_DHW_ACTIVATION_NO_YES`)

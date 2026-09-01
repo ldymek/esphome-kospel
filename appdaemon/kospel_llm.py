@@ -10,6 +10,7 @@ Deploy: /addon_configs/a0d7b954_appdaemon/apps/{kospel_llm.py,apps.yaml,.pstryk-
 """
 import appdaemon.plugins.hass.hassapi as hass
 import json, urllib.request, datetime, time, os
+import kospel_engine as eng
 
 APPDIR = os.path.dirname(os.path.abspath(__file__))
 PSTRYK_KEY_FILE = os.path.join(APPDIR, ".pstryk-key")
@@ -37,6 +38,15 @@ class KospelLLM(hass.Hass):
         self.dhw_samples = []        # (ts, temp) ring, ~12 min, sampled every 60 s
         self.dhw_last_sample = 0.0
         self.dhw_last_publish = 0.0
+        self._away_since = None
+        self._last_plan = None
+        self.run_in(self.fit_models, 180)                 # thermal + tank models from 7d history
+        self.run_daily(self.fit_models, "03:30:00")
+        self.run_daily(self.savings_job, "00:15:00")      # yesterday's counterfactual savings
+        self.run_daily(self.diag_job, "04:00:00")         # degradation / drift monitors
+        self.run_daily(self.weekly_digest, "08:00:00")    # Monday report
+        for sc, d in (("script.kospel_za_zimno", 1), ("script.kospel_za_cieplo", -1)):
+            self.listen_state(self.override_event, sc, attribute="last_triggered", direction=d)
         self.run_every(self.tick, "now+10", 20)
         self.log("Kospel LLM maintainer (AppDaemon) initialized")
 
@@ -310,7 +320,7 @@ class KospelLLM(hass.Hass):
             f"{r['t_local']}: {r['full']} zł/kWh" + (" [tanio]" if r["cheap"] else "") + (" [drogo]" if r["exp"] else "")
             for r in prices["curve"])
         user = ("Stan kotła:\n" + json.dumps(snap, ensure_ascii=False) +
-                "\n\nCeny zakupu energii (najbliższe godziny):\n" + curve + self.price_context(prices) +
+                "\n\nCeny zakupu energii (najbliższe godziny):\n" + curve + self.price_context(prices) + self.context_hint() +
                 "\n\nZaproponuj plan sterowania: w których godzinach grzać mocniej (wyższa moc / wcześniejsze "
                 "nagrzanie CO i CWU, magazynowanie ciepła w TANICH godzinach), a kiedy ograniczyć moc (DROGIE "
                 "godziny), utrzymując komfort ~21-22°C. Podaj 3-5 konkretnych kroków z godzinami i szacowany "
@@ -455,6 +465,9 @@ class KospelLLM(hass.Hass):
     def disengage_autonomy(self, reason):
         a = self.load_auton()
         if not a.get("active"): return
+        if a.get("battery_orig") is not None:
+            self.call_service("number/set_value", entity_id="number.kc868_heater_heater_dhw_comfort_temp", value=a["battery_orig"])
+            a["battery_orig"] = None
         # stop the ESP-side power steering; the backup loop below restores the user's index
         try:
             self.call_service("esphome/kc868_heater_set_power_plan",
@@ -518,6 +531,7 @@ class KospelLLM(hass.Hass):
                                   entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
             else:
                 self.power_cap_tick(room, floor)
+                self.battery_tick()
 
     # ---------- price-driven power plan (opt-in, autonomy only) ----------
     # The heater has no native power schedule, so the AI PUSHES a rolling 24h plan (max-power
@@ -539,7 +553,8 @@ class KospelLLM(hass.Hass):
             h = ts.astimezone().hour
             if h in seen: continue
             seen.add(h)
-            plan[h] = 0 if r["exp"] else (3 if r["cheap"] else 2)
+            t_exp, t_norm, t_cheap = eng.PREF.get(self.prefs()["pref"], eng.PREF["Balans"])["tiers"]
+            plan[h] = t_exp if r["exp"] else (t_cheap if r["cheap"] else t_norm)
         sig = (tuple(plan), round(floor, 1), enable)
         if sig == getattr(self, "_pwr_sig", None) and time.time() - getattr(self, "_pwr_push", 0) < 900:
             return   # 15-min re-push heartbeat: an ESP reboot wipes the plan (globals not restored)
@@ -571,70 +586,397 @@ class KospelLLM(hass.Hass):
                   "doplacic. Okna zgraj z harmonogramem CWU tak, by zasobnik byl juz nagrzany.")},
     ]
 
-    def propose_schedule(self, cfg, prices, forecast):
-        """Design daily programs for CO + CWU (numbers-only JSON, hard-validated) and write each to
-        its program-8 slot. Weekly assignment untouched here -> inactive unless the user/autonomy points a day at 8."""
-        if not self.rate_limit_ok():
-            self.log("schedule write skipped: daily rate limit reached", level="WARNING"); return None
-        schema = {"type": "object", "properties": {"slots": {"type": "array", "maxItems": 5,
-                  "items": {"type": "object", "properties": {
-                      "start_min": {"type": "integer", "minimum": 0, "maximum": 1439},
-                      "stop_min": {"type": "integer", "minimum": 1, "maximum": 1439},
-                      "level": {"type": "integer", "enum": [1, 2, 3, 4]}},
-                      "required": ["start_min", "stop_min", "level"]}}}, "required": ["slots"]}
-        live = self.load_auton().get("active", False)
+    # ================= PLANNER MODES: LLM / Silnik / Hybryda =================
+    PLANER_LLM, PLANER_ENGINE, PLANER_HYBRID = "LLM", "Silnik", "Hybryda (silnik + weryfikacja LLM)"
+    SLOT_SCHEMA = {"type": "object", "properties": {"slots": {"type": "array", "maxItems": 5,
+                   "items": {"type": "object", "properties": {
+                       "start_min": {"type": "integer", "minimum": 0, "maximum": 1439},
+                       "stop_min": {"type": "integer", "minimum": 1, "maximum": 1439},
+                       "level": {"type": "integer", "enum": [1, 2, 3, 4]}},
+                       "required": ["start_min", "stop_min", "level"]}}}, "required": ["slots"]}
+
+    def engine_state_file(self): return os.path.join(APPDIR, "engine.json")
+    def load_engine(self):
+        try: return json.load(open(self.engine_state_file()))
+        except Exception: return {}
+    def save_engine(self, e):
+        try: json.dump(e, open(self.engine_state_file(), "w"))
+        except Exception as ex: self.log(f"engine save err: {ex}", level="ERROR")
+
+    def fnum(self, eid, default=None):
+        try: return float(self.stt(eid))
+        except (TypeError, ValueError): return default
+
+    def prefs(self):
+        e = self.load_engine()
+        pref = self.stt("input_select.kospel_preferencja", "Balans")
+        if pref not in eng.PREF: pref = "Balans"
+        return {"pref": pref, "battery": self.stt("input_boolean.kospel_zawor_mieszajacy") == "on",
+                "battery_temp": self.fnum("input_number.kospel_cwu_magazyn_temp", 60.0),
+                "bias": e.get("bias", [0.0] * 24), "flat": self.fnum("input_number.kospel_taryfa_plaska", 1.10)}
+
+    def presence_away(self):
+        """All tracked persons away >= 30 min (or a calendar 'urlop' event) -> eco planning."""
+        persons = self.args.get("persons") or [e for e in self.get_state("person") or {}]
+        states = [self.stt(p) for p in persons]
+        known = [s for s in states if s not in ("unknown", "unavailable", "?")]
+        away_now = bool(known) and all(s != "home" for s in known)
+        cal = self.args.get("calendar")
+        if cal and self.stt(cal) == "on":
+            msg = str(self.get_state(cal, attribute="message") or "").lower()
+            if any(w in msg for w in ("urlop", "wakacje", "vacation", "wyjazd")): away_now = True
+        now = time.time()
+        if away_now:
+            if self._away_since is None: self._away_since = now
+            return now - self._away_since >= 1800
+        self._away_since = None
+        return False
+
+    def hours_from_prices(self, prices):
+        hours, seen = [None] * 24, set()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for r in prices.get("all", []):
+            try: ts = datetime.datetime.fromisoformat(r["iso"].replace("Z", "+00:00"))
+            except Exception: continue
+            if ts + datetime.timedelta(hours=1) <= now or ts - now > datetime.timedelta(hours=24): continue
+            h = ts.astimezone().hour
+            if h in seen: continue
+            seen.add(h); hours[h] = {"price": r["full"], "cheap": r["cheap"], "exp": r["exp"]}
+        return hours
+
+    def engine_plan(self, prices):
+        e = self.load_engine()
+        thermal, tank = eng.ThermalModel(e.get("thermal")), eng.TankModel(e.get("tank"))
+        u = self.dhw_load()
+        usage = [round(p + t, 1) for p, t in zip(u["profile"], u["today"])]
+        pr = self.prefs()
+        out = eng.plan(self.hours_from_prices(prices), usage, thermal, tank, pref=pr["pref"],
+                       away=self.presence_away(), bias=pr["bias"],
+                       tin=self.fnum("sensor.kc868_heater_heater_room_temp"),
+                       tout=self.fnum("sensor.kc868_heater_heater_outside_temp"), battery=pr["battery"])
+        self._last_plan = out
+        return out
+
+    def publish_engine_plan(self, out, mode, verify=None):
+        m = out.get("model", {})
+        attrs = {"friendly_name": "Plan silnika (deterministyczny)", "icon": "mdi:engine",
+                 "tryb_planera": mode, "preferencja": out.get("pref"), "nikogo_w_domu": out.get("away"),
+                 "CO": eng.human(out["CO"]), "CWU": eng.human(out["CWU"]), "Cyrkulacja": eng.human(out["Cyrkulacja"]),
+                 "plan_mocy": ",".join(str(x) for x in out["power_plan"]),
+                 "uzasadnienie": out.get("rationale", []),
+                 "model_termiczny_ok": bool(m.get("thermal_ok")),
+                 "stala_czasowa_h": round(m["tau_h"], 1) if m.get("tau_h") else None,
+                 "zasobnik_K_h_na_kW": m.get("tank_rate_per_kw"),
+                 "godzina_magazynu": out.get("battery_hour")}
+        if verify is not None: attrs["weryfikacja_llm"] = verify
+        self.set_state("sensor.kospel_plan_silnika", state=time.strftime("%Y-%m-%d %H:%M"), attributes=attrs)
+
+    def context_hint(self):
+        pr = self.prefs(); parts = []
+        if any(abs(b) > 0.5 for b in pr["bias"]):
+            warm = [f"{h:02d}" for h, b in enumerate(pr["bias"]) if b > 0.5]
+            cold = [f"{h:02d}" for h, b in enumerate(pr["bias"]) if b < -0.5]
+            if warm: parts.append("uzytkownik zglaszal 'za zimno' okolo godzin: " + ",".join(warm))
+            if cold: parts.append("uzytkownik zglaszal 'za cieplo' okolo godzin: " + ",".join(cold))
+        if self.presence_away(): parts.append("NIKOGO W DOMU (wszyscy poza domem >30 min) -> tryb eko")
+        parts.append(f"preferencja uzytkownika: {pr['pref']}")
+        return "\nKontekst domownikow: " + "; ".join(parts) + "\n"
+
+    def parse_slots(self, slots):
+        clean = []
+        for s in slots or []:
+            try: clean.append((int(s["start_min"]), int(s["stop_min"]), int(s["level"])))
+            except Exception: pass
+        return eng.validate_slots(clean)
+
+    def llm_plans(self, cfg, prices, forecast, live):
+        """Original LLM path: one constrained-JSON call per timetable -> {key: slots}."""
         curve = "\n".join(f"{r['t_local']}: {r['full']} zl/kWh" + (" TANIO" if r["cheap"] else "")
                           + (" DROGO" if r["exp"] else "") for r in prices["curve"])
         fc = ("\nPrognoza pogody (godzinowa):\n" + "\n".join(forecast)) if forecast else ""
-        lvl = {1: "Ochrona", 2: "Komfort", 3: "Komfort-", 4: "Komfort+"}
-        out = {}
-        usage = self.dhw_usage_hint()
+        usage = self.dhw_usage_hint(); ctx = self.context_hint()
+        plans = {}
         for tt in self.TIMETABLES:
             live_note = (f"UWAGA: ten program jest AKTYWNY i steruje kotlem ({tt['key']}). Zachowaj komfort "
                          "w typowych godzinach uzytkowania, oszczedzaj tylko gdy drogo.\n") if live else ""
             user = (live_note + f"Zaprojektuj DZIENNY program {tt['key']} (max 5 przedzialow czasowych).\n"
                     "Poziomy: " + tt["levels"] + "\n" + tt["goal"] + "\n"
                     "Minuty od polnocy (0-1439), start_min < stop_min, rosnaco i bez nakladania.\n\n"
-                    "Ceny energii:\n" + curve + self.price_context(prices) + fc
+                    "Ceny energii:\n" + curve + self.price_context(prices) + fc + ctx
                     + (usage if tt["key"] in ("CWU", "Cyrkulacja") else ""))
             raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
                                           "You design heating schedules. Output ONLY JSON per schema.",
-                                          user, schema=schema, thinking=False, temp=0.1, npredict=400)
-            try:
-                slots = json.loads(raw).get("slots", [])
-            except Exception:
-                self.log(f"{tt['key']} schedule JSON parse failed", level="WARNING"); continue
-            clean, last_stop = [], -1
-            for s in sorted(slots, key=lambda x: x.get("start_min", 0)):
-                try:
-                    a, b, v = int(s["start_min"]), int(s["stop_min"]), int(s["level"])
-                except Exception:
-                    continue
-                if not (0 <= a < b <= 1439 and 1 <= v <= 4 and a >= last_stop):
-                    continue
-                clean.append((a, b, v)); last_stop = b
-                if len(clean) == 5:
-                    break
-            if not clean:
-                self.log(f"{tt['key']} proposal had no valid slots", level="WARNING"); continue
+                                          user, schema=self.SLOT_SCHEMA, thinking=False, temp=0.1, npredict=400)
+            try: slots = self.parse_slots(json.loads(raw).get("slots", []))
+            except Exception: slots = []
+            if slots: plans[tt["key"]] = slots
+            else: self.log(f"{tt['key']} LLM proposal had no valid slots", level="WARNING")
+        return plans
+
+    def llm_verify_plan(self, cfg, out, prices, forecast):
+        """Hybryda: the LLM audits the engine's plan; may amend a timetable (validated) or just comment."""
+        slot_schema = {"type": "array", "maxItems": 5, "items": {"type": "object", "properties": {
+                           "start_min": {"type": "integer"}, "stop_min": {"type": "integer"},
+                           "level": {"type": "integer", "enum": [1, 2, 3, 4]}},
+                           "required": ["start_min", "stop_min", "level"]}}
+        schema = {"type": "object", "properties": {
+                      "zatwierdzam": {"type": "boolean"},
+                      "uwagi": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+                      "poprawki": {"type": "object", "properties": {
+                          "CO": slot_schema, "CWU": slot_schema, "Cyrkulacja": slot_schema}}},
+                  "required": ["zatwierdzam", "uwagi"]}
+        curve = "\n".join(f"{r['t_local']}: {r['full']} zl/kWh" + (" TANIO" if r["cheap"] else "")
+                          + (" DROGO" if r["exp"] else "") for r in prices["curve"])
+        fc = ("\nPrognoza pogody:\n" + "\n".join(forecast)) if forecast else ""
+        user = ("Silnik deterministyczny zaproponowal programy dzienne kotla. Zweryfikuj je jako ekspert: "
+                "czy sa bezpieczne (komfort, brak grzania w drogich godzinach bez potrzeby, CWU przed poborem), "
+                "spojne z cenami i pogoda. Jesli plan jest dobry -> zatwierdzam=true, uwagi krotkie. "
+                "Jesli widzisz KONKRETNY blad, podaj poprawiony program w 'poprawki' (tylko dla tej tabeli, "
+                "max 5 przedzialow, minuty 0-1439, poziomy 1=Ochrona 2=Komfort 3=Komfort- 4=Komfort+). "
+                "Nie przepisuj planu bez powodu.\n\n"
+                f"PLAN SILNIKA (preferencja {out.get('pref')}, nikogo w domu={out.get('away')}):\n"
+                f"CO: {eng.human(out['CO'])}\nCWU: {eng.human(out['CWU'])}\nCyrkulacja: {eng.human(out['Cyrkulacja'])}\n"
+                "Uzasadnienie silnika:\n- " + "\n- ".join(out.get("rationale", [])) + "\n\n"
+                "Ceny energii:\n" + curve + self.price_context(prices) + fc + self.dhw_usage_hint() + self.context_hint())
+        try:
+            raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
+                                          "You audit heating schedules. Output ONLY JSON per schema.",
+                                          user, schema=schema, thinking=False, temp=0.1, npredict=600)
+            v = json.loads(raw)
+        except Exception as ex:
+            self.log(f"hybrid verify failed: {ex}", level="WARNING")
+            return {"zatwierdzam": None, "uwagi": ["weryfikacja LLM niedostepna"]}, {}
+        adj = {}
+        for k, slots in (v.get("poprawki") or {}).items():
+            if k in ("CO", "CWU", "Cyrkulacja") and slots:
+                clean = self.parse_slots(slots)
+                if clean and clean != out[k]: adj[k] = clean
+        verify = {"zatwierdzam": v.get("zatwierdzam"), "uwagi": v.get("uwagi", [])[:5],
+                  "poprawione": list(adj.keys()), "czas_s": round(dt, 1)}
+        self.log(f"hybrid verify: {verify}")
+        return verify, adj
+
+    def write_plans(self, plans, source, live):
+        lvl = {1: "Ochrona", 2: "Komfort", 3: "Komfort-", 4: "Komfort+"}
+        out = {}
+        for tt in self.TIMETABLES:
+            clean = plans.get(tt["key"])
+            if not clean: continue
             base = tt["base"] + 15 * (self.AI_PROG_NR - 1)
             starts = [c[0] for c in clean] + [65535] * (5 - len(clean))
             stops = [c[1] for c in clean] + [65535] * (5 - len(clean))
             idxs = [c[2] for c in clean] + [65535] * (5 - len(clean))
             self.call_service("esphome/kc868_heater_set_daily_program_heater",
                               base=base, starts=starts, stops=stops, idxs=idxs)
-            self.count_write()
+            self.count_write(); time.sleep(0.4)
             human = [f"{a//60:02d}:{a%60:02d}-{b//60:02d}:{b%60:02d} {lvl[v]}" for a, b, v in clean]
             status_txt = "AKTYWNY (autonomia)" if live else "NIEAKTYWNY"
             self.set_state(tt["sensor"], state=time.strftime("%Y-%m-%d %H:%M"),
                            attributes={"friendly_name": f"Program AI {tt['key']} (8)",
                                        "icon": "mdi:calendar-star", "przedzialy": human,
+                                       "zrodlo": source.get(tt["key"], "?"),
                                        "zapisano_do": f"{tt['key']} program {self.AI_PROG_NR} ({status_txt})",
                                        "aktywacja": ("steruje kotłem (Autonomiczny)" if live else
                                                      f"ustaw dzień na 8 w Programy {tt['key']} lub tryb Autonomiczny")})
-            self.log(f"AI schedule -> {tt['key']} program {self.AI_PROG_NR} [{status_txt}]: {human}")
+            self.log(f"schedule[{source.get(tt['key'])}] -> {tt['key']} program {self.AI_PROG_NR} [{status_txt}]: {human}")
             out[tt["key"]] = human
         return out or None
+
+    def propose_schedule(self, cfg, prices, forecast):
+        """Daily programs -> program 8, by planner mode: LLM (constrained JSON per timetable),
+        Silnik (deterministic engine), Hybryda (engine plans, LLM audits/amends). The engine's plan
+        is always published to sensor.kospel_plan_silnika for inspection, whatever the mode."""
+        mode = self.stt("input_select.kospel_planer", self.PLANER_LLM)
+        live = self.load_auton().get("active", False)
+        engine_out = None
+        try: engine_out = self.engine_plan(prices)
+        except Exception as ex: self.log(f"engine plan error: {type(ex).__name__} {ex}", level="WARNING")
+        plans, source, verify, adj = {}, {}, None, {}
+        if mode.startswith("Hybryda") and engine_out:
+            verify, adj = self.llm_verify_plan(cfg, engine_out, prices, forecast)
+        if engine_out:
+            self.publish_engine_plan(engine_out, mode, verify)   # dry-run view, even when writes are rate-limited
+        if not self.rate_limit_ok():
+            self.log("schedule write skipped: daily rate limit reached", level="WARNING"); return None
+        if mode.startswith("Silnik") and engine_out:
+            for k in ("CO", "CWU", "Cyrkulacja"): plans[k] = engine_out[k]; source[k] = "Silnik"
+        elif mode.startswith("Hybryda") and engine_out:
+            for k in ("CO", "CWU", "Cyrkulacja"):
+                if k in adj: plans[k] = adj[k]; source[k] = "Hybryda: poprawka LLM"
+                else:
+                    plans[k] = engine_out[k]
+                    source[k] = "Hybryda: silnik (LLM zatwierdził)" if verify.get("zatwierdzam") else "Hybryda: silnik (uwagi LLM)"
+        else:
+            plans = self.llm_plans(cfg, prices, forecast, live); source = {k: "LLM" for k in plans}
+        return self.write_plans(plans, source, live)
+
+    # ================= models / learning / analytics =================
+    def fetch_series(self, eid, hours):
+        start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)).isoformat()
+        try:
+            r = self.sup_json(f"/history/period/{start}?filter_entity_id={eid}&minimal_response&no_attributes", timeout=90)
+        except Exception as ex:
+            self.log(f"history {eid}: {type(ex).__name__} {str(ex)[:80]}", level="WARNING"); return []
+        out = []
+        for s in (r[0] if r else []):
+            try: out.append((datetime.datetime.fromisoformat(s["last_changed"].replace("Z", "+00:00")).timestamp(), float(s["state"])))
+            except (TypeError, ValueError, KeyError): pass
+        return out
+
+    def fit_models(self, kwargs=None):
+        e = self.load_engine(); t1 = time.time(); t0 = t1 - 7 * 86400
+        th = eng.ThermalModel(e.get("thermal")); tk = eng.TankModel(e.get("tank"))
+        try:
+            th.fit(self.fetch_series("sensor.kc868_heater_heater_room_temp", 168),
+                   self.fetch_series("sensor.kc868_heater_heater_outside_temp", 168),
+                   self.fetch_series("sensor.kospel_moc_co", 168), t0, t1)
+            tk.fit(self.fetch_series("sensor.kc868_heater_heater_dhw_temp", 168),
+                   self.fetch_series("sensor.kospel_moc_cwu", 168), t0, t1)
+        except Exception as ex:
+            self.log(f"model fit error: {type(ex).__name__} {ex}", level="WARNING")
+        e["thermal"], e["tank"] = th.to_dict(), tk.to_dict()
+        e["bias"] = [round(b * 0.9, 2) for b in e.get("bias", [0.0] * 24)]   # overrides fade slowly
+        self.save_engine(e)
+        self.set_state("sensor.kospel_model_termiczny", state="OK" if th.ok() else "uczy się",
+                       attributes={"friendly_name": "Model termiczny budynku", "icon": "mdi:home-thermometer",
+                                   "stala_czasowa_h": round(th.tau_h(), 1) if th.ok() else None,
+                                   "grzanie_w_danych": th.heating_seen, "probki": th.n,
+                                   "blad_rmse_K_h": round(th.rmse, 3) if th.rmse else None,
+                                   "wzmocnienie_K_h_na_kW": round(th.b * 3600, 4) if th.b else None,
+                                   "zasobnik_K_h_na_kW": round(tk.rate_per_kw, 2), "zasobnik_straty_K_h": round(tk.loss_kh, 2),
+                                   "zasobnik_probki": tk.n, "zasobnik_degradacja_pct": tk.degradation_pct(),
+                                   "dopasowano": time.strftime("%Y-%m-%d %H:%M")})
+        self.log(f"models: thermal ok={th.ok()} tau={th.tau_h()} heating_seen={th.heating_seen} n={th.n}; tank rate={tk.rate_per_kw:.2f} loss={tk.loss_kh:.2f} n={tk.n}")
+
+    def override_event(self, entity, attribute, old, new, kwargs):
+        if not new or new == old: return
+        d = kwargs.get("direction", 0); h = datetime.datetime.now().hour
+        e = self.load_engine(); bias = e.get("bias", [0.0] * 24)
+        for k in (h - 1, h, h + 1):
+            if 0 <= k < 24: bias[k] = round(max(-2.0, min(2.0, 0.6 * bias[k] + 0.4 * d * (1.5 if k == h else 1.0))), 2)
+        e["bias"] = bias
+        e.setdefault("overrides", []).append({"t": time.strftime("%Y-%m-%d %H:%M"), "dir": d, "hour": h})
+        e["overrides"] = e["overrides"][-100:]; self.save_engine(e)
+        self.log(f"override learned: {'za zimno' if d > 0 else 'za cieplo'} @ {h:02d}:00 -> bias[{h}]={bias[h]}")
+
+    def battery_tick(self):
+        """Thermal battery (only with a mixing valve): in the plan's cheapest hour raise the DHW
+        comfort setpoint to the storage temperature, restore afterwards."""
+        pr = self.prefs(); a = self.load_auton(); hour = datetime.datetime.now().hour
+        plan = self._last_plan or {}
+        want = (pr["battery"] and plan.get("battery_hour") == hour
+                and self.stt("switch.kc868_heater_zasobnik_cwu_wlaczony") == "on")
+        ent = "number.kc868_heater_heater_dhw_comfort_temp"
+        if want and a.get("battery_orig") is None:
+            orig = self.fnum(ent)
+            if orig is None: return
+            a["battery_orig"] = orig; self.save_auton(a)
+            self.call_service("number/set_value", entity_id=ent, value=min(65.0, max(orig, pr["battery_temp"])))
+            self.log(f"AUTONOMY: magazyn ciepla CWU {orig} -> {pr['battery_temp']} C (godz. {hour})")
+        elif not want and a.get("battery_orig") is not None:
+            self.call_service("number/set_value", entity_id=ent, value=a["battery_orig"])
+            self.log(f"AUTONOMY: magazyn ciepla koniec -> CWU komfort {a['battery_orig']} C")
+            a["battery_orig"] = None; self.save_auton(a)
+
+    def local_day_start(self, days_ago=1):
+        loc = datetime.datetime.now().astimezone()
+        d = (loc - datetime.timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return d, d.timestamp()
+
+    def yesterday_data(self):
+        day, ds = self.local_day_start(1)
+        hb = int((time.time() - ds) / 3600) + 2
+        kco = eng.hourly_kwh_from_total(self.fetch_series("sensor.kospel_energia_co", hb), ds, 0)
+        kcwu = eng.hourly_kwh_from_total(self.fetch_series("sensor.kospel_energia_cwu", hb), ds, 0)
+        prices = eng.resample(self.fetch_series("sensor.kospel_cena_zakupu_teraz", hb), ds, ds + 23 * 3600, 3600)[:24]
+        return day, kco, kcwu, prices
+
+    def savings_job(self, kwargs=None):
+        try:
+            day, kco, kcwu, prices = self.yesterday_data()
+            res = eng.counterfactual([a + b for a, b in zip(kco, kcwu)], prices, self.prefs()["flat"])
+            if not res: return
+            res.update({"data": day.strftime("%Y-%m-%d"), "kwh_co": round(sum(kco), 2), "kwh_cwu": round(sum(kcwu), 2)})
+            e = self.load_engine()
+            e["savings"] = ([s for s in e.get("savings", []) if s.get("data") != res["data"]] + [res])[-60:]
+            self.save_engine(e); self.publish_savings(e)
+        except Exception as ex:
+            self.log(f"savings job error: {type(ex).__name__} {ex}", level="WARNING")
+
+    def publish_savings(self, e):
+        sv = e.get("savings", [])
+        if not sv: return
+        y = sv[-1]
+        def agg(n):
+            part = sv[-n:]
+            return {"kwh": round(sum(s["kwh"] for s in part), 1), "koszt": round(sum(s["koszt"] for s in part), 2),
+                    "oszczednosc_vs_srednia": round(sum(s["oszczednosc_vs_srednia"] for s in part), 2),
+                    "oszczednosc_vs_plaska": round(sum(s["oszczednosc_vs_plaska"] for s in part), 2), "dni": len(part)}
+        self.set_state("sensor.kospel_oszczednosci", state=str(y["oszczednosc_vs_srednia"]),
+                       attributes={"friendly_name": "Oszczędności AI (vs średnia cena dnia)", "icon": "mdi:piggy-bank",
+                                   "unit_of_measurement": "PLN", "wczoraj": y, "ostatnie_7_dni": agg(7), "ostatnie_30_dni": agg(30),
+                                   "metoda": "koszt rzeczywisty vs to samo zużycie po średniej cenie dnia / po taryfie płaskiej"})
+
+    def weekly_digest(self, kwargs=None):
+        if datetime.datetime.now().weekday() != 0: return
+        e = self.load_engine(); sv = e.get("savings", [])[-7:]
+        if not sv: return
+        kwh = sum(s["kwh"] for s in sv); cost = sum(s["koszt"] for s in sv)
+        sa = sum(s["oszczednosc_vs_srednia"] for s in sv); sf = sum(s["oszczednosc_vs_plaska"] for s in sv)
+        diag = self.get_state("sensor.kospel_diagnostyka", attribute="all") or {}
+        issues = (diag.get("attributes") or {}).get("uwagi") or []
+        msg = (f"Tydzień: {kwh:.0f} kWh za {cost:.2f} zł. Dzięki przesuwaniu zużycia: {sa:+.2f} zł vs średnia cena dnia, "
+               f"{sf:+.2f} zł vs taryfa płaska. " + ("Diagnostyka: " + "; ".join(issues) if issues else "Diagnostyka: bez uwag."))
+        self.call_service("persistent_notification/create", notification_id="kospel_tydzien",
+                          title="Kocioł — raport tygodniowy", message=msg)
+
+    def diag_job(self, kwargs=None):
+        issues, attrs = [], {}
+        try:
+            pres = self.fetch_series("sensor.kc868_heater_heater_water_pressure", 168)
+            sl = eng.slope_per_day(pres)
+            cur = self.fnum("sensor.kc868_heater_heater_water_pressure")
+            attrs["cisnienie_bar"] = cur; attrs["cisnienie_trend_bar_dzien"] = round(sl, 3) if sl is not None else None
+            if sl is not None and sl < -0.03: issues.append(f"ciśnienie spada {sl:.3f} bar/dzień — możliwa nieszczelność / naczynie wzbiorcze")
+            if cur is not None and cur < 0.8: issues.append(f"niskie ciśnienie {cur:.2f} bar — dopuść wodę")
+            e = self.load_engine(); tk = eng.TankModel(e.get("tank"))
+            deg = tk.degradation_pct(); attrs["zasobnik_degradacja_pct"] = deg
+            if deg is not None and deg > 20: issues.append(f"zasobnik grzeje się o {deg:.0f}% wolniej niż na początku — kamień / grzałka")
+            th = eng.ThermalModel(e.get("thermal"))
+            attrs["stala_czasowa_h"] = round(th.tau_h(), 1) if th.ok() else None
+        except Exception as ex:
+            self.log(f"diag error: {type(ex).__name__} {ex}", level="WARNING")
+        attrs.update({"friendly_name": "Diagnostyka kotła", "icon": "mdi:stethoscope", "uwagi": issues,
+                      "sprawdzono": time.strftime("%Y-%m-%d %H:%M")})
+        self.set_state("sensor.kospel_diagnostyka", state="UWAGA" if issues else "OK", attributes=attrs)
+        if issues:
+            self.call_service("persistent_notification/create", notification_id="kospel_diag",
+                              title="Kocioł — diagnostyka", message="\n".join("• " + i for i in issues))
+
+    def run_backtest(self):
+        try:
+            day, kco, kcwu, prices = self.yesterday_data()
+            known = sorted(p for p in prices if p is not None)
+            if len(known) < 12: raise ValueError("za mało cen z wczoraj")
+            q30, q75 = known[int(len(known) * 0.3)], known[int(len(known) * 0.75)]
+            hours = [({"price": p, "cheap": p <= q30, "exp": p >= q75} if p is not None else None) for p in prices]
+            e = self.load_engine(); u = self.dhw_load(); pr = self.prefs()
+            usage = [round(a + b, 1) for a, b in zip(u["profile"], u["today"])]
+            out = eng.plan(hours, usage, eng.ThermalModel(e.get("thermal")), eng.TankModel(e.get("tank")),
+                           pref=pr["pref"], away=False, bias=pr["bias"],
+                           tin=self.fnum("sensor.kc868_heater_heater_room_temp"),
+                           tout=self.fnum("sensor.kc868_heater_heater_outside_temp"), battery=pr["battery"])
+            bt = eng.backtest(out, kcwu, kco, prices)
+            self.set_state("sensor.kospel_backtest", state=str(bt["roznica"]),
+                           attributes={"friendly_name": "Backtest silnika (wczoraj)", "icon": "mdi:history",
+                                       "unit_of_measurement": "PLN", "dzien": day.strftime("%Y-%m-%d"),
+                                       "CO": eng.human(out["CO"]), "CWU": eng.human(out["CWU"]), "Cyrkulacja": eng.human(out["Cyrkulacja"]),
+                                       "kwh_co": round(sum(kco), 2), "kwh_cwu": round(sum(kcwu), 2), **bt,
+                                       "uzasadnienie": out["rationale"]})
+            self.log(f"backtest {day.date()}: {bt}")
+        except Exception as ex:
+            self.log(f"backtest error: {type(ex).__name__} {ex}", level="WARNING")
+            self.set_state("sensor.kospel_backtest", state="błąd", attributes={"friendly_name": "Backtest silnika (wczoraj)", "blad": str(ex)[:200]})
 
     def run_once(self):
         cfg = {
@@ -818,6 +1160,9 @@ class KospelLLM(hass.Hass):
                 except Exception: pass
             enabled = self.stt("input_boolean.kospel_llm_enable") == "on"
             run_now = self.stt("input_boolean.kospel_llm_run_now") == "on"
+            if self.stt("input_boolean.kospel_backtest_run") == "on":
+                self.call_service("input_boolean/turn_off", entity_id="input_boolean.kospel_backtest_run")
+                self.run_backtest()
             interval_h = float(self.stt("input_number.kospel_llm_interwal_h", "6") or 6)
             self.autonomy_tick(self.stt("input_select.kospel_llm_tryb"))
             if run_now:

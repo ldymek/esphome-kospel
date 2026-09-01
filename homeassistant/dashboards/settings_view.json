@@ -52,6 +52,50 @@
      "cards": [
       {
        "type": "heading",
+       "heading": "Planer AI — silnik i preferencje",
+       "heading_style": "title",
+       "icon": "mdi:engine"
+      },
+      {
+       "type": "entities",
+       "entities": [
+        {
+         "entity": "input_select.kospel_planer",
+         "name": "Kto planuje (LLM / Silnik / Hybryda)"
+        },
+        {
+         "entity": "input_select.kospel_preferencja",
+         "name": "Preferencja: koszt vs komfort"
+        },
+        {
+         "entity": "input_boolean.kospel_zawor_mieszajacy",
+         "name": "Magazyn ciepła CWU (tylko z zaworem mieszającym!)"
+        },
+        {
+         "entity": "input_number.kospel_cwu_magazyn_temp",
+         "name": "Temp. magazynu CWU"
+        },
+        {
+         "entity": "input_number.kospel_taryfa_plaska",
+         "name": "Taryfa płaska do porównań"
+        },
+        {
+         "entity": "input_boolean.kospel_backtest_run",
+         "name": "Uruchom backtest (wczoraj)"
+        }
+       ]
+      },
+      {
+       "type": "markdown",
+       "content": "**LLM** — model językowy projektuje programy (dotychczasowe zachowanie). **Silnik** — deterministyczny planer (model termiczny + profil poboru + ceny). **Hybryda** — silnik planuje, LLM audytuje i może poprawić. Plan silnika jest zawsze publikowany do podglądu, niezależnie od trybu. Magazyn ciepła podnosi temperaturę zasobnika w najtańszej godzinie — **włącz tylko, jeśli masz zawór mieszający** (ryzyko poparzenia)."
+      }
+     ]
+    },
+    {
+     "type": "grid",
+     "cards": [
+      {
+       "type": "heading",
        "heading": "Pstryk — ceny energii",
        "heading_style": "title",
        "icon": "mdi:cash-clock"

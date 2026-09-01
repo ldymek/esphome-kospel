@@ -30,6 +30,13 @@ and a supervised autonomous mode with hard guardrails.
   daily programs into the heater's unused **program 8** (shadow mode) or actively points the week
   at them (**Autonomiczny**) with watchdog + automatic rollback. Learns the household's hot-water
   rhythm from tank-temperature draw detection — no water meter needed.
+- **Two planners, your choice (v2)** — `input_select.kospel_planer`: **LLM** (the language model
+  designs the programs), **Silnik** (a deterministic engine: fitted thermal model of the house +
+  tank model + hot-water usage clusters + prices, no GPU needed) or **Hybryda** (the engine plans,
+  the LLM audits and may amend). The engine's plan is always published for comparison. Preference
+  slider (Oszczędność / Balans / Komfort), presence-aware eco mode, "too cold / too warm" feedback
+  buttons, daily savings vs flat tariff, weekly digest, pressure/tank-degradation diagnostics and a
+  one-click backtest — see [docs/ENGINE.md](docs/ENGINE.md).
 - **Price-driven power plan (opt-in)** — the heater has no native power schedule, so the AI
   pushes a rolling 24 h plan into the ESP (expensive hours 12 kW, normal 20, cheap 24) and the
   ESP executes it with local guards even with HA down: comfort floor, tank below 35 °C (heavy
@@ -182,6 +189,7 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 
 ## Roadmap
 
+- ~~Deterministic planning engine + hybrid LLM verification, savings & diagnostics~~ — shipped in v2 (docs/ENGINE.md).
 - **Custom Home Assistant integration** (`custom_components/`) with a config-flow settings page —
   so the project shows up as a real HA integration (Ollama host, Pstryk key, etc.) instead of
   AppDaemon + helpers.
