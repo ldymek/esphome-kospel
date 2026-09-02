@@ -59,25 +59,31 @@ must be ordered, non-overlapping, ≤5 per program and use valid levels.
 
 ## Hard rules (applied to every planner)
 
-Learned the expensive way on 2026-09-01: the LLM left the CWU timetable blank (economic setpoint)
-through the 17–22 price peak and opened a 5-hour circulation window at the same time. Circulation
-drains the tank at roughly 3 K/h, so the heater topped it up every hour at 1.5–1.7 PLN/kWh. Since
-then `kospel_engine.enforce_rules()` runs on whatever the active planner produced (LLM, engine or an
-LLM amendment) before anything is written, and the same rules are spelled out in the LLM prompt with
-today's actual expensive/cheap hours (`rules_hint`):
+Two lessons shaped these. On 2026-09-01 a 5-hour circulation window through the 17–22 price peak
+(the pump drains the tank at roughly 3 K/h) made the heater top the tank up every hour at
+1.5–1.7 PLN/kWh. The first fix, "Ochrona in every expensive hour", was worse: on 2026-09-02 Pstryk
+flagged 06:00–19:00 as expensive, and for the CWU timetable **level 1 means the heater does not heat
+the tank at all**, so the tank starved to 20 °C. Since then `kospel_engine.enforce_rules()` runs on
+whatever the active planner produced (LLM, engine or an LLM amendment) before anything is written,
+and the same rules are spelled out in the LLM prompt with the day's actual peak (`rules_hint`):
 
 | Rule | Oszczędność | Balans | Komfort |
 |---|---|---|---|
-| CWU level in expensive hours | Ochrona | Ochrona | economic (unchanged) |
-| Tank charge before a peak block | last cheap hour before it | same | same |
+| CWU level 1 (no heating) allowed | 00:00–05:00 only | never (away mode only) | never (away mode only) |
+| CWU in expensive hours | economic maintenance (gap) | same | same |
+| Tank charge before the day's price peak | last cheaper hour before it | same | same |
 | Circulation per draw cluster | 1 h | 2 h | 3 h |
 | Circulation inside expensive hours (total) | 1 h | 1 h | 2 h |
 | Circulation per day (total) | 3 h | 4 h | 5 h |
 
-When trimming circulation the hours with the strongest observed draws are kept. A Komfort charge the
-planner placed *inside* a peak is kept only if it is the plan's only charge. Corrections are logged
-and published in the schedule sensor attribute `korekty_regul`, and the `zrodlo` attribute gets a
-"+ reguły" suffix so you can see the guard acted.
+**Tank floor** overrides every plan: tank below 35 °C removes level 1 from the next four hours, below
+30 °C forces a Komfort slot for the current hour regardless of price. A separate monitor
+(`cwu_floor_tick`, every 20 s, at most one write per 45 min) rewrites only the CWU program when the
+tank is cold under a "no heating" slot, outside the daily write budget, and raises a notification.
+The "price peak" is the contiguous block around the day's maximum price (≥85 % of it, at most 5 h),
+not Pstryk's `is_expensive` flag, which can cover most of a day. When trimming circulation the hours
+with the strongest observed draws are kept. Corrections are logged and published in the schedule
+sensor attribute `korekty_regul`, and `zrodlo` gets a "+ reguły" suffix so you can see the guard acted.
 
 ## Hybrid verification
 

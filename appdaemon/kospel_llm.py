@@ -532,6 +532,7 @@ class KospelLLM(hass.Hass):
             else:
                 self.power_cap_tick(room, floor)
                 self.battery_tick()
+                self.cwu_floor_tick()
 
     # ---------- price-driven power plan (opt-in, autonomy only) ----------
     # The heater has no native power schedule, so the AI PUSHES a rolling 24h plan (max-power
@@ -574,11 +575,12 @@ class KospelLLM(hass.Hass):
          "goal": ("Komfort (2-3) rano ~6-9 i wieczorem ~16-22; dogrzej/magazynuj cieplo (4) w NAJTANSZYCH "
                   "godzinach; Ochrona (1) w NAJDROZSZYCH i w nocy.")},
         {"key": "CWU", "base": 3230, "sensor": "sensor.kospel_ai_harmonogram_cwu",
-         "levels": "dla cieplej wody (CWU): 2=grzej zasobnik do komfortu, 1=ekonomicznie (podtrzymanie)",
-         "goal": ("Nagrzej zasobnik CWU (2) w 1-2 tanich godzinach TUZ PRZED kazdym klastrem poboru (rano ~6:00, "
-                  "wieczor) — a przed drogim blokiem cenowym w OSTATNIEJ taniej godzinie przed nim. "
-                  "W GODZINACH DROGICH zawsze poziom 1 (Ochrona): zasobnik pracuje na zapasie, kociol NIE dogrzewa "
-                  "w szczycie cen. Poza przedzialami = ekonomicznie (podtrzymanie) — tylko w godzinach tanich/srednich.")},
+         "levels": ("dla cieplej wody (CWU): 2=grzej zasobnik do komfortu (45 C); POZA przedzialami kociol podtrzymuje "
+                    "temperature ekonomiczna (39 C); 1=Ochrona = kociol NIE grzeje zasobnika wcale (woda stygnie!)"),
+         "goal": ("Nagrzej zasobnik (2) w 1-2 tanszych godzinach TUZ PRZED kazdym klastrem poboru (rano, wieczor) "
+                  "oraz w OSTATNIEJ tanszej godzinie przed szczytem cen. W szczycie cen zostaw przerwe (podtrzymanie "
+                  "ekonomiczne), NIE poziom 1. Poziom 1 (brak grzania) TYLKO w nocy 00:00-05:00, gdy nikt nie uzywa "
+                  "wody — nigdy w godzinach poboru, nigdy dluzej niz 5 h z rzedu. Zimny zasobnik = brak wody dla domownikow.")},
         {"key": "Cyrkulacja", "base": 3360, "sensor": "sensor.kospel_ai_harmonogram_cyrk",
          "levels": ("dla pompy CYRKULACJI CWU: w przedziale pompa krazy (ciepla woda od reki w lazience), "
                     "poza przedzialami stoi (zero strat ciepla w rurach). Poziom zawsze 2."),
@@ -673,6 +675,37 @@ class KospelLLM(hass.Hass):
         if verify is not None: attrs["weryfikacja_llm"] = verify
         self.set_state("sensor.kospel_plan_silnika", state=time.strftime("%Y-%m-%d %H:%M"), attributes=attrs)
 
+    def cwu_floor_tick(self):
+        """Safety net: the tank is cold while the ACTIVE CWU program says 'no heating' (level 1) or has
+        no Komfort now -> rewrite ONLY the CWU program with the floor rules (tank < 35 -> economic
+        maintenance; < 30 -> heat now). Runs every tick, acts at most once per 45 min, autonomy only."""
+        try:
+            if not self.load_auton().get("active"): return
+            tank = self.fnum("sensor.kc868_heater_heater_dhw_temp")
+            if tank is None or tank >= eng.CWU_FLOOR_ECON: return
+            if self.stt("binary_sensor.kc868_heater_heater_dhw_demand") == "on": return   # already recovering
+            if time.time() - getattr(self, "_floor_ts", 0) < 45 * 60: return
+            plan = getattr(self, "_cwu_written", None)
+            if plan is None:
+                st = self.get_state("sensor.kospel_ai_harmonogram_cwu", attribute="all") or {}
+                plan = self.parse_slots([{"start_min": int(p[0:2]) * 60 + int(p[3:5]), "stop_min": int(p[6:8]) * 60 + int(p[9:11]),
+                                          "level": {"Ochrona": 1, "Komfort": 2, "Komfort-": 3, "Komfort+": 4}[p.split(" ", 1)[1]]}
+                                         for p in (st.get("attributes", {}).get("przedzialy") or [])])
+            now = datetime.datetime.now(); nm = now.hour * 60 + now.minute
+            active = [lv for a, b, lv in plan if a <= nm < b]
+            if tank >= eng.CWU_FLOOR_HEAT and not (active and active[0] == 1): return   # economic gap will recover on its own
+            hours = self.hours_from_prices(self.last_prices) if getattr(self, "last_prices", None) else [None] * 24
+            fixed, notes = eng.enforce_rules("CWU", plan or [(0, 60, 1)], hours, self.prefs()["pref"], None,
+                                             tank_temp=tank, now_hour=now.hour, away=False)
+            if not notes: return
+            self._floor_ts = time.time()
+            self.log(f"CWU FLOOR: zasobnik {tank:.1f} C, aktywny poziom {active}; korekta -> {eng.human(fixed)} {notes}", level="WARNING")
+            self.write_plans({"CWU": fixed}, {"CWU": "korekta awaryjna (zimny zasobnik)"}, True, {"CWU": notes})
+            self.call_service("persistent_notification/create", notification_id="kospel_cwu_floor",
+                              title="Kocioł: zimny zasobnik CWU", message=f"Zasobnik {tank:.1f} °C. " + " ".join(notes))
+        except Exception as ex:
+            self.log(f"cwu_floor_tick error: {type(ex).__name__} {ex}", level="WARNING")
+
     def rules_hint(self, prices):
         """Explicit, price-specific hard rules for the LLM (mirrors eng.enforce_rules)."""
         hours = self.hours_from_prices(prices)
@@ -686,9 +719,11 @@ class KospelLLM(hass.Hass):
                 elif (h == 24 or h not in hs) and s is not None: out.append(f"{s:02d}:00-{h:02d}:00"); s = None
             return ", ".join(out) or "brak"
         txt = f"\n\nTWARDE REGULY (preferencja {self.prefs()['pref']}):\n- Godziny DROGIE dzis: {spans(exp_h)}. Godziny TANIE: {spans(cheap_h)}.\n"
-        if P["cwu_peak"] is not None:
-            txt += (f"- CWU: w godzinach drogich poziom 1 (Ochrona). Nagrzej zasobnik (2) w ostatniej taniej/sredniej godzinie "
-                    f"przed kazdym drogim blokiem oraz 1 h przed porannym poborem. Zaden poziom 2 w godzinach drogich.\n")
+        pk = eng.peak_block(hours)
+        if pk:
+            txt += f"- Szczyt cen dzis: {pk[0]:02d}:00-{pk[1]:02d}:00 -> zaladuj zasobnik (2) w ostatniej tanszej godzinie przed nim.\n"
+        txt += ("- CWU: poziom 1 (Ochrona = brak grzania) dozwolony TYLKO 00:00-05:00; w innych godzinach zostanie "
+                "zamieniony na podtrzymanie ekonomiczne. Zasobnik ponizej 35 C wymusza grzanie niezaleznie od ceny.\n")
         txt += (f"- Cyrkulacja: lacznie max {P['circ_day_cap_h']} h/dobe, w godzinach drogich max {P['circ_exp_cap_h']} h; "
                 "tylko godziny najsilniejszego poboru z profilu.\n"
                 "- Program, ktory lamie te reguly, zostanie automatycznie skorygowany.")
@@ -805,6 +840,7 @@ class KospelLLM(hass.Hass):
                                        "aktywacja": ("steruje kotłem (Autonomiczny)" if live else
                                                      f"ustaw dzień na 8 w Programy {tt['key']} lub tryb Autonomiczny")})
             self.log(f"schedule[{source.get(tt['key'])}] -> {tt['key']} program {self.AI_PROG_NR} [{status_txt}]: {human}")
+            if tt["key"] == "CWU": self._cwu_written = list(clean)
             out[tt["key"]] = human
         return out or None
 
@@ -838,8 +874,10 @@ class KospelLLM(hass.Hass):
         hours = self.hours_from_prices(prices); pr = self.prefs()
         u = self.dhw_load(); usage = [round(p + t_, 1) for p, t_ in zip(u["profile"], u["today"])]
         fixes = {}
+        tank_t = self.fnum("sensor.kc868_heater_heater_dhw_temp")
         for k in list(plans.keys()):
-            fixed, notes = eng.enforce_rules(k, plans[k], hours, pr["pref"], usage)
+            fixed, notes = eng.enforce_rules(k, plans[k], hours, pr["pref"], usage, tank_temp=tank_t,
+                                             now_hour=datetime.datetime.now().hour, away=self.presence_away())
             if notes:
                 plans[k] = fixed; fixes[k] = notes; source[k] = source.get(k, "?") + " + reguły"
                 self.log(f"rules[{k}]: {notes} -> {eng.human(fixed)}")

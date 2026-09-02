@@ -60,24 +60,31 @@ przedziały muszą być uporządkowane, nienachodzące, ≤5 na program i z popr
 
 ## Twarde reguły (stosowane do każdego planera)
 
-Lekcja z 2026-09-01: LLM zostawił harmonogram CWU pusty (nastawa ekonomiczna) przez szczyt cenowy
-17–22 i jednocześnie otworzył 5-godzinne okno cyrkulacji. Krążenie chłodzi zasobnik ok. 3 K/h, więc
-kocioł dogrzewał go co godzinę po 1,5–1,7 zł/kWh. Od tego czasu `kospel_engine.enforce_rules()`
-przechodzi po wyniku aktywnego planera (LLM, silnik albo poprawka LLM) przed jakimkolwiek zapisem,
-a te same reguły trafiają do promptu LLM razem z dzisiejszymi godzinami drogimi/tanimi (`rules_hint`):
+Ukształtowały je dwie lekcje. 2026-09-01 pięciogodzinne okno cyrkulacji w szczycie cen 17–22 (pompa
+chłodzi zasobnik ok. 3 K/h) sprawiło, że kocioł dogrzewał zasobnik co godzinę po 1,5–1,7 zł/kWh.
+Pierwsza poprawka — „Ochrona w każdej drogiej godzinie" — była gorsza: 2026-09-02 Pstryk oznaczył jako
+drogie 06:00–19:00, a w harmonogramie CWU **poziom 1 oznacza, że kocioł w ogóle nie grzeje
+zasobnika**, więc zasobnik wystygł do 20 °C. Od tego czasu `kospel_engine.enforce_rules()` przechodzi
+po wyniku aktywnego planera (LLM, silnik albo poprawka LLM) przed jakimkolwiek zapisem, a te same
+reguły trafiają do promptu LLM razem z dzisiejszym szczytem cen (`rules_hint`):
 
 | Reguła | Oszczędność | Balans | Komfort |
 |---|---|---|---|
-| Poziom CWU w godzinach drogich | Ochrona | Ochrona | ekonomiczny (bez zmian) |
-| Ładowanie zasobnika przed drogim blokiem | ostatnia tania godzina przed nim | tak samo | tak samo |
+| Poziom 1 CWU (brak grzania) dozwolony | tylko 00:00–05:00 | nigdy (tylko tryb „nikogo w domu") | nigdy (tylko tryb „nikogo w domu") |
+| CWU w godzinach drogich | podtrzymanie ekonomiczne (przerwa) | tak samo | tak samo |
+| Ładowanie zasobnika przed szczytem cen | ostatnia tańsza godzina przed nim | tak samo | tak samo |
 | Cyrkulacja na klaster poboru | 1 h | 2 h | 3 h |
 | Cyrkulacja w godzinach drogich (łącznie) | 1 h | 1 h | 2 h |
 | Cyrkulacja na dobę (łącznie) | 3 h | 4 h | 5 h |
 
-Przy skracaniu cyrkulacji zostają godziny o najsilniejszym zaobserwowanym poborze. Ładowanie Komfort,
-które planer umieścił *w* szczycie, zostaje tylko wtedy, gdy jest jedynym ładowaniem w planie.
-Korekty są logowane i publikowane w atrybucie `korekty_regul` sensora harmonogramu, a atrybut
-`zrodlo` dostaje dopisek „+ reguły", żeby było widać, że strażnik zadziałał.
+**Próg zasobnika** nadpisuje każdy plan: zasobnik poniżej 35 °C usuwa poziom 1 z najbliższych czterech
+godzin, poniżej 30 °C wymusza przedział Komfort w bieżącej godzinie niezależnie od ceny. Osobny monitor
+(`cwu_floor_tick`, co 20 s, najwyżej jeden zapis na 45 min) przepisuje tylko program CWU, gdy zasobnik
+jest zimny pod przedziałem „brak grzania", poza dziennym budżetem zapisów, i wysyła powiadomienie.
+„Szczyt cen" to ciągły blok wokół maksimum dnia (≥85 % maksimum, najwyżej 5 h), a nie flaga Pstryk
+`is_expensive`, która może objąć większość dnia. Przy skracaniu cyrkulacji zostają godziny o
+najsilniejszym zaobserwowanym poborze. Korekty są logowane i publikowane w atrybucie `korekty_regul`
+sensora harmonogramu, a `zrodlo` dostaje dopisek „+ reguły".
 
 ## Weryfikacja hybrydowa
 

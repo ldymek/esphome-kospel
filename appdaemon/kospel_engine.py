@@ -161,16 +161,22 @@ PREF = {   # idle = outside comfort windows (None -> heater economic setpoint, c
            # peak = expensive hour inside a comfort window when the building can NOT coast;
            # tiers = power-plan index (exp, normal, cheap); tmin_off = tolerated drop below setpoint
     "Oszczędność": {"idle": None, "peak": OCHRONA, "tiers": (0, 1, 3), "tmin_off": 1.5,
-                    "cwu_peak": OCHRONA, "circ_per_cluster": 1, "circ_exp_cap_h": 1, "circ_day_cap_h": 3},
+                    "cwu_peak": None, "cwu_night_off": True, "circ_per_cluster": 1, "circ_exp_cap_h": 1, "circ_day_cap_h": 3},
     "Balans":      {"idle": None, "peak": KOMFORT_MINUS, "tiers": (0, 2, 3), "tmin_off": 1.0,
-                    "cwu_peak": OCHRONA, "circ_per_cluster": 2, "circ_exp_cap_h": 1, "circ_day_cap_h": 4},
+                    "cwu_peak": None, "cwu_night_off": False, "circ_per_cluster": 2, "circ_exp_cap_h": 1, "circ_day_cap_h": 4},
     "Komfort":     {"idle": KOMFORT_MINUS, "peak": KOMFORT, "tiers": (2, 3, 3), "tmin_off": 0.5,
-                    "cwu_peak": None, "circ_per_cluster": 3, "circ_exp_cap_h": 2, "circ_day_cap_h": 5},
+                    "cwu_peak": None, "cwu_night_off": False, "circ_per_cluster": 3, "circ_exp_cap_h": 2, "circ_day_cap_h": 5},
 }
-# Lesson 2026-09-01: a blank (economic) CWU level through the 17-22 price peak plus a 5 h circulation
-# window made the heater top the tank up every hour at 1.5-1.7 zl/kWh (circulation drains ~3 K/h).
-# Hard rules below: expensive hours -> CWU Ochrona (tank charged in the last cheap hour before the
-# block), circulation only on the strongest draw hours, capped per cluster / in the peak / per day.
+# Lesson 2026-09-01: a 5 h circulation window through the 17-22 price peak (pump drains the tank
+# ~3 K/h) made the heater top the tank up every hour at 1.5-1.7 zl/kWh.
+# Lesson 2026-09-02 (worse): "Ochrona in every expensive hour" starved the tank to 20 C, because the
+# CWU level 1 means the heater does NOT heat the tank at all and Pstryk flagged 06-19 as expensive.
+# Rules now: CWU level 1 only at night (00-05, Oszczednosc) or when nobody is home; expensive hours
+# use the heater's economic setpoint (gap); a Komfort charge goes into the last cheaper hour before
+# the day's price peak; circulation only on the strongest draw hours, capped; and a TANK FLOOR
+# overrides everything (tank < 35 C -> no level 1 for the next hours, < 30 C -> heat now).
+CWU_NIGHT = range(0, 5)
+CWU_FLOOR_ECON, CWU_FLOOR_HEAT = 35.0, 30.0
 DEFAULT_COMFORT_WINDOWS = [(6, 9), (16, 22)]
 
 def _compress(levels_by_hour, max_slots=5):
@@ -231,7 +237,17 @@ def _to_quarters(slots):
         for i in range(max(0, a // 15), min(96, (b + 14) // 15)): q[i] = lv
     return q
 
-def enforce_rules(key, slots, hours, pref="Balans", usage=None):
+def peak_block(hours, max_len=5, rel=0.85):
+    """Contiguous block of hours around the day's max price (>= rel*max), <= max_len hours."""
+    known = [h for h in range(24) if hours and h < len(hours) and hours[h] and hours[h].get("price") is not None]
+    if not known: return None
+    hm = max(known, key=lambda h: hours[h]["price"]); pm = hours[hm]["price"]
+    a = b = hm
+    while a - 1 in known and hours[a - 1]["price"] >= rel * pm and b - a + 1 < max_len: a -= 1
+    while b + 1 in known and hours[b + 1]["price"] >= rel * pm and b - a + 1 < max_len: b += 1
+    return (a, b + 1)
+
+def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, now_hour=None, away=False):
     """Programmatic guard applied to ANY planner's output (LLM, engine, hybrid amendment) before it
     is written to the heater. Returns (slots, notes). Rules (by preference):
     CWU  - expensive hours are Ochrona (no hourly top-ups in the price peak); a Komfort charge that
@@ -242,24 +258,43 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None):
     notes = []
     if not slots or key not in ("CWU", "Cyrkulacja"): return slots, notes
     def exp(h): return bool((hours[h] or {}).get("exp")) if hours and h < len(hours) else False
-    exp_hours = [h for h in range(24) if exp(h)]
-    if not exp_hours: return slots, notes
+    def price(h): return (hours[h] or {}).get("price") if hours and h < len(hours) else None
     q = _to_quarters(slots)
-    if key == "CWU" and P["cwu_peak"] is not None:
-        komf_all = [i for i in range(96) if q[i] in (KOMFORT, KOMFORT_PLUS)]
-        komf_exp = [i for i in komf_all if exp(i // 4)]
-        changed = []
+    if key == "CWU":
+        # (a) level 1 (= tank NOT heated) only at night / when away; elsewhere -> economic gap
+        off_ok = set(CWU_NIGHT) if (P["cwu_night_off"] or pref == "Oszczędność") else set()
+        if away: off_ok = set(range(24))
+        moved = sorted({i // 4 for i in range(96) if q[i] == OCHRONA and (i // 4) not in off_ok})
         for i in range(96):
-            h = i // 4
-            if not exp(h): continue
-            if q[i] in (KOMFORT, KOMFORT_PLUS) and len(komf_exp) == len(komf_all): continue  # only charge -> keep
-            if q[i] != P["cwu_peak"]:
-                q[i] = P["cwu_peak"]; changed.append(h)
-        if changed:
-            hs = sorted(set(changed))
-            notes.append(f"CWU: godziny drogie {hs[0]:02d}-{hs[-1]+1:02d} -> {LEVEL_NAME[P['cwu_peak']]} (bez dogrzewań w szczycie cen)")
+            if q[i] == OCHRONA and (i // 4) not in off_ok: q[i] = None
+        if moved:
+            notes.append(f"CWU: poziom Ochrona (brak grzania) usunięty z godzin {moved[0]:02d}-{moved[-1]+1:02d} -> ekonomicznie (zasobnik podtrzymywany)")
+        # (b) a Komfort charge in the last cheaper hour before the day's price peak (if still ahead)
+        pk = peak_block(hours)
+        if pk and not away:
+            a, b = pk
+            pre = [h for h in range(max(0, a - 3), a) if (price(h) is not None) and price(h) < 0.9 * price(a)]
+            future_ok = now_hour is None or a - 1 > now_hour
+            if pre and future_ok and not any(q[i] in (KOMFORT, KOMFORT_PLUS) for i in range(pre[0] * 4, a * 4)):
+                best = min(pre, key=lambda h: (price(h), -h))
+                for i in range(best * 4, best * 4 + 4): q[i] = KOMFORT
+                notes.append(f"CWU: dodano ładowanie o {best:02d}:00 przed szczytem cen {a:02d}-{b:02d}")
+        # (c) tank floor: cold tank overrides any plan
+        if tank_temp is not None and now_hour is not None:
+            if tank_temp < CWU_FLOOR_ECON:
+                for h in range(now_hour, min(24, now_hour + 4)):
+                    for i in range(h * 4, h * 4 + 4):
+                        if q[i] == OCHRONA: q[i] = None
+                notes.append(f"CWU: zasobnik {tank_temp:.0f} °C < {CWU_FLOOR_ECON:.0f} -> najbliższe godziny bez Ochrony (podtrzymanie ekonomiczne)")
+            if tank_temp < CWU_FLOOR_HEAT:
+                for i in range(now_hour * 4, min(96, now_hour * 4 + 4)): q[i] = KOMFORT
+                notes.append(f"CWU: zasobnik {tank_temp:.0f} °C < {CWU_FLOOR_HEAT:.0f} -> grzanie TERAZ ({now_hour:02d}:00) niezależnie od ceny")
         return _compress_q(q, 5), notes
     if key == "Cyrkulacja":
+        for i in range(96):
+            if q[i] is not None and q[i] != KOMFORT: q[i] = KOMFORT   # circulation slots are on/off; level is always 2
+        exp_hours = [h for h in range(24) if exp(h)]
+        if not exp_hours: return _compress_q(q, 4), notes
         on = [i for i in range(96) if q[i] is not None]
         if not on: return slots, notes
         def weight(i):  # prefer quarters in hours with observed draws
@@ -370,20 +405,19 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
     # expensive hours: Ochrona instead of the economic setpoint (no hourly top-ups in the peak);
     # make sure a Komfort charge sits in the last non-expensive hours before each peak block that
     # overlaps (or is followed within 2 h by) a draw cluster.
-    if P["cwu_peak"] is not None and not away:
-        for h in range(24):
-            if exp(h) and (h == 0 or not exp(h - 1)):
-                blk = 1
-                while h + blk < 24 and exp(h + blk): blk += 1
-                uses = any(hs <= h + blk + 1 and he >= h for hs, he in cl) if cl else True
-                pre_win = [k for k in range(max(0, h - 4), h) if not exp(k)]
-                if uses and pre_win and not any(cwu[k] == KOMFORT for k in pre_win):
-                    best = min(pre_win, key=lambda k: (price(k) if price(k) is not None else 9) + 0.03 * (h - 1 - k))
-                    cwu[best] = KOMFORT
-                    notes.append(f"CWU: ładowanie o {best:02d}:00 przed drogim blokiem {h:02d}-{h+blk:02d}" + (f" ({price(best)} zł/kWh)" if price(best) is not None else ""))
-        exp_set = [h for h in range(24) if exp(h) and cwu[h] is None]
-        for h in exp_set: cwu[h] = P["cwu_peak"]
-        if exp_set: notes.append(f"CWU: w drogich godzinach poziom {LEVEL_NAME[P['cwu_peak']]} — zasobnik pracuje na zapasie, bez dogrzewań w szczycie")
+    if not away:
+        pk = peak_block(hours)
+        if pk:
+            a, b = pk
+            pre = [k for k in range(max(0, a - 3), a) if price(k) is not None and price(k) < 0.9 * price(a)]
+            if pre and not any(cwu[k] == KOMFORT for k in pre):
+                best = min(pre, key=lambda k: (price(k), -k))
+                cwu[best] = KOMFORT
+                notes.append(f"CWU: ładowanie o {best:02d}:00 przed szczytem cen {a:02d}-{b:02d} ({price(best)} zł/kWh); w szczycie tylko podtrzymanie ekonomiczne")
+        if P["cwu_night_off"]:
+            for h in CWU_NIGHT:
+                if cwu[h] is None and not any(hs <= h + 1 <= he + 1 for hs, he in cl): cwu[h] = OCHRONA
+            notes.append("CWU: w nocy 00-05 bez grzania (Oszczędność)")
     battery_hour = None
     if battery and known:
         hb = min(known, key=lambda h: price(h))
