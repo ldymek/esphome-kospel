@@ -580,7 +580,8 @@ class KospelLLM(hass.Hass):
          "goal": ("Nagrzej zasobnik (2) w 1-2 tanszych godzinach TUZ PRZED kazdym klastrem poboru (rano, wieczor) "
                   "oraz w OSTATNIEJ tanszej godzinie przed szczytem cen. W szczycie cen zostaw przerwe (podtrzymanie "
                   "ekonomiczne), NIE poziom 1. Poziom 1 (brak grzania) TYLKO w nocy 00:00-05:00, gdy nikt nie uzywa "
-                  "wody — nigdy w godzinach poboru, nigdy dluzej niz 5 h z rzedu. Zimny zasobnik = brak wody dla domownikow.")},
+                  "wody — nigdy w godzinach poboru. Przedzialy Komfort (2): 2-4 sztuki po 1-2 h, LACZNIE max 4 h/dobe "
+                  "(dluzsze = zasobnik trzymany w 45 C caly dzien = drogo). Nigdy jeden dlugi przedzial Komfort.")},
         {"key": "Cyrkulacja", "base": 3360, "sensor": "sensor.kospel_ai_harmonogram_cyrk",
          "levels": ("dla pompy CYRKULACJI CWU: w przedziale pompa krazy (ciepla woda od reki w lazience), "
                     "poza przedzialami stoi (zero strat ciepla w rurach). Poziom zawsze 2."),
@@ -676,14 +677,14 @@ class KospelLLM(hass.Hass):
         self.set_state("sensor.kospel_plan_silnika", state=time.strftime("%Y-%m-%d %H:%M"), attributes=attrs)
 
     def cwu_floor_tick(self):
-        """Safety net: the tank is cold while the ACTIVE CWU program says 'no heating' (level 1) or has
-        no Komfort now -> rewrite ONLY the CWU program with the floor rules (tank < 35 -> economic
-        maintenance; < 30 -> heat now). Runs every tick, acts at most once per 45 min, autonomy only."""
+        """Self-healing guard on the ACTIVE CWU program: re-applies eng.enforce_rules (tank floor,
+        no 'no-heating' level outside the night, Komfort budget, pre-peak charge) to what is written on
+        the heater and rewrites ONLY the CWU program if that changes anything. Runs every tick, acts at
+        most once per 45 min, autonomy only, outside the daily LLM write budget."""
         try:
             if not self.load_auton().get("active"): return
             tank = self.fnum("sensor.kc868_heater_heater_dhw_temp")
-            if tank is None or tank >= eng.CWU_FLOOR_ECON: return
-            if self.stt("binary_sensor.kc868_heater_heater_dhw_demand") == "on": return   # already recovering
+            if tank is None: return
             if time.time() - getattr(self, "_floor_ts", 0) < 45 * 60: return
             plan = getattr(self, "_cwu_written", None)
             if plan is None:
@@ -693,16 +694,17 @@ class KospelLLM(hass.Hass):
                                          for p in (st.get("attributes", {}).get("przedzialy") or [])])
             now = datetime.datetime.now(); nm = now.hour * 60 + now.minute
             active = [lv for a, b, lv in plan if a <= nm < b]
-            if tank >= eng.CWU_FLOOR_HEAT and not (active and active[0] == 1): return   # economic gap will recover on its own
             hours = self.hours_from_prices(self.last_prices) if getattr(self, "last_prices", None) else [None] * 24
-            fixed, notes = eng.enforce_rules("CWU", plan or [(0, 60, 1)], hours, self.prefs()["pref"], None,
-                                             tank_temp=tank, now_hour=now.hour, away=False)
-            if not notes: return
+            u = self.dhw_load(); usage = [round(p + t_, 1) for p, t_ in zip(u["profile"], u["today"])]
+            fixed, notes = eng.enforce_rules("CWU", plan or [(0, 60, 1)], hours, self.prefs()["pref"], usage,
+                                             tank_temp=tank, now_hour=now.hour, away=self.presence_away())
+            if not notes or fixed == plan: return
             self._floor_ts = time.time()
-            self.log(f"CWU FLOOR: zasobnik {tank:.1f} C, aktywny poziom {active}; korekta -> {eng.human(fixed)} {notes}", level="WARNING")
-            self.write_plans({"CWU": fixed}, {"CWU": "korekta awaryjna (zimny zasobnik)"}, True, {"CWU": notes})
-            self.call_service("persistent_notification/create", notification_id="kospel_cwu_floor",
-                              title="Kocioł: zimny zasobnik CWU", message=f"Zasobnik {tank:.1f} °C. " + " ".join(notes))
+            self.log(f"CWU GUARD: zasobnik {tank:.1f} C, aktywny poziom {active}; korekta -> {eng.human(fixed)} {notes}", level="WARNING")
+            self.write_plans({"CWU": fixed}, {"CWU": "korekta strażnika CWU"}, True, {"CWU": notes})
+            if tank < eng.CWU_FLOOR_HEAT:
+                self.call_service("persistent_notification/create", notification_id="kospel_cwu_floor",
+                                  title="Kocioł: zimny zasobnik CWU", message=f"Zasobnik {tank:.1f} °C. " + " ".join(notes))
         except Exception as ex:
             self.log(f"cwu_floor_tick error: {type(ex).__name__} {ex}", level="WARNING")
 
@@ -723,7 +725,8 @@ class KospelLLM(hass.Hass):
         if pk:
             txt += f"- Szczyt cen dzis: {pk[0]:02d}:00-{pk[1]:02d}:00 -> zaladuj zasobnik (2) w ostatniej tanszej godzinie przed nim.\n"
         txt += ("- CWU: poziom 1 (Ochrona = brak grzania) dozwolony TYLKO 00:00-05:00; w innych godzinach zostanie "
-                "zamieniony na podtrzymanie ekonomiczne. Zasobnik ponizej 35 C wymusza grzanie niezaleznie od ceny.\n")
+                f"zamieniony na podtrzymanie ekonomiczne. Komfort (2) LACZNIE max {P['cwu_komfort_cap_h']} h/dobe w 1-2 h "
+                "przedzialach przed poborem — nadmiar zostanie usuniety. Zasobnik ponizej 35 C wymusza grzanie niezaleznie od ceny.\n")
         txt += (f"- Cyrkulacja: lacznie max {P['circ_day_cap_h']} h/dobe, w godzinach drogich max {P['circ_exp_cap_h']} h; "
                 "tylko godziny najsilniejszego poboru z profilu.\n"
                 "- Program, ktory lamie te reguly, zostanie automatycznie skorygowany.")

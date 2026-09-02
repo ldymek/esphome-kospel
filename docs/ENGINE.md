@@ -77,11 +77,14 @@ and the same rules are spelled out in the LLM prompt with the day's actual peak 
 | Circulation per day (total) | 3 h | 4 h | 5 h |
 
 **Tank floor** overrides every plan: tank below 35 °C removes level 1 from the next four hours, below
-30 °C forces a Komfort slot for the current hour regardless of price. A separate monitor
-(`cwu_floor_tick`, every 20 s, at most one write per 45 min) rewrites only the CWU program when the
-tank is cold under a "no heating" slot, outside the daily write budget, and raises a notification.
+30 °C forces a Komfort slot for the current hour regardless of price. A separate self-healing monitor
+(`cwu_floor_tick`, every 20 s, at most one write per 45 min) re-applies the rules to the program that is
+actually on the heater and rewrites only the CWU program if that changes anything, outside the daily
+write budget; a cold tank additionally raises a notification. The CWU Komfort budget is 3 / 4 / 6 hours
+a day (Oszczędność / Balans / Komfort), keeping the hours that serve the coming draws.
 The "price peak" is the contiguous block around the day's maximum price (≥85 % of it, at most 5 h),
-not Pstryk's `is_expensive` flag, which can cover most of a day. When trimming circulation the hours
+not Pstryk's `is_expensive` flag, which can cover most of a day; the flag now only steers the ESP power
+cap, while all programme levels (CO, CWU, circulation) use the peak block. When trimming circulation the hours
 with the strongest observed draws are kept. Corrections are logged and published in the schedule
 sensor attribute `korekty_regul`, and `zrodlo` gets a "+ reguły" suffix so you can see the guard acted.
 

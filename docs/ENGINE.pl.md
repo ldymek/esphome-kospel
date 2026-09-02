@@ -78,11 +78,14 @@ reguły trafiają do promptu LLM razem z dzisiejszym szczytem cen (`rules_hint`)
 | Cyrkulacja na dobę (łącznie) | 3 h | 4 h | 5 h |
 
 **Próg zasobnika** nadpisuje każdy plan: zasobnik poniżej 35 °C usuwa poziom 1 z najbliższych czterech
-godzin, poniżej 30 °C wymusza przedział Komfort w bieżącej godzinie niezależnie od ceny. Osobny monitor
-(`cwu_floor_tick`, co 20 s, najwyżej jeden zapis na 45 min) przepisuje tylko program CWU, gdy zasobnik
-jest zimny pod przedziałem „brak grzania", poza dziennym budżetem zapisów, i wysyła powiadomienie.
+godzin, poniżej 30 °C wymusza przedział Komfort w bieżącej godzinie niezależnie od ceny. Osobny samonaprawczy monitor
+(`cwu_floor_tick`, co 20 s, najwyżej jeden zapis na 45 min) nakłada reguły na program faktycznie
+zapisany w kotle i przepisuje tylko program CWU, jeśli coś się zmienia, poza dziennym budżetem zapisów;
+zimny zasobnik dodatkowo wysyła powiadomienie. Budżet Komfort CWU to 3 / 4 / 6 h na dobę
+(Oszczędność / Balans / Komfort), zostają godziny obsługujące nadchodzący pobór.
 „Szczyt cen" to ciągły blok wokół maksimum dnia (≥85 % maksimum, najwyżej 5 h), a nie flaga Pstryk
-`is_expensive`, która może objąć większość dnia. Przy skracaniu cyrkulacji zostają godziny o
+`is_expensive`, która może objąć większość dnia; flaga steruje już tylko limitem mocy w ESP, a wszystkie
+poziomy programów (CO, CWU, cyrkulacja) używają bloku szczytu. Przy skracaniu cyrkulacji zostają godziny o
 najsilniejszym zaobserwowanym poborze. Korekty są logowane i publikowane w atrybucie `korekty_regul`
 sensora harmonogramu, a `zrodlo` dostaje dopisek „+ reguły".
 
