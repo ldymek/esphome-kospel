@@ -70,23 +70,28 @@ reguły trafiają do promptu LLM razem z dzisiejszym szczytem cen (`rules_hint`)
 
 | Reguła | Oszczędność | Balans | Komfort |
 |---|---|---|---|
-| Poziom 1 CWU (brak grzania) dozwolony | tylko 00:00–05:00 | nigdy (tylko tryb „nikogo w domu") | nigdy (tylko tryb „nikogo w domu") |
+| Poziom 1 CWU (brak grzania) | wymuszony 22:00–05:00 (bez poboru) | wymuszony 22:00–05:00 (bez poboru) | nigdy (tylko tryb „nikogo w domu") |
 | CWU w godzinach drogich | podtrzymanie ekonomiczne (przerwa) | tak samo | tak samo |
 | Ładowanie zasobnika przed szczytem cen | ostatnia tańsza godzina przed nim | tak samo | tak samo |
+| Przedziały Komfort | po 1 h, 3 h/dobę | po 1 h, 4 h/dobę | po 1 h, 6 h/dobę |
 | Cyrkulacja na klaster poboru | 1 h | 2 h | 3 h |
 | Cyrkulacja w godzinach drogich (łącznie) | 1 h | 1 h | 2 h |
 | Cyrkulacja na dobę (łącznie) | 3 h | 4 h | 5 h |
 
-**Próg zasobnika** nadpisuje każdy plan: zasobnik poniżej 35 °C usuwa poziom 1 z najbliższych czterech
-godzin, poniżej 30 °C wymusza przedział Komfort w bieżącej godzinie niezależnie od ceny. Osobny samonaprawczy monitor
+**Próg zasobnika** nadpisuje każdy plan: zasobnik poniżej 35 °C przy spodziewanym poborze w najbliższych
+czterech godzinach usuwa z nich poziom 1, poniżej 30 °C wymusza przedział Komfort w bieżącej godzinie
+niezależnie od ceny. Lekcja 2026-09-03: podtrzymanie ekonomiczne 39 °C przez całą noc to impuls 20 kW co
+~4 h, a 2-godzinny przedział Komfort dodawał kolejny — stąd okno nocne i przedziały 1 h (zasobnik 200 l
+ładuje się w ~10 min). Osobny samonaprawczy monitor
 (`cwu_floor_tick`, co 20 s, najwyżej jeden zapis na 45 min) nakłada reguły na program faktycznie
 zapisany w kotle i przepisuje tylko program CWU, jeśli coś się zmienia, poza dziennym budżetem zapisów;
 zimny zasobnik dodatkowo wysyła powiadomienie. Budżet Komfort CWU to 3 / 4 / 6 h na dobę
 (Oszczędność / Balans / Komfort), zostają godziny obsługujące nadchodzący pobór.
 „Szczyt cen" to ciągły blok wokół maksimum dnia (≥85 % maksimum, najwyżej 5 h), a nie flaga Pstryk
 `is_expensive`, która może objąć większość dnia; flaga steruje już tylko limitem mocy w ESP, a wszystkie
-poziomy programów (CO, CWU, cyrkulacja) używają bloku szczytu. Przy skracaniu cyrkulacji zostają godziny o
-najsilniejszym zaobserwowanym poborze. Korekty są logowane i publikowane w atrybucie `korekty_regul`
+poziomy programów (CO, CWU, cyrkulacja) używają bloku szczytu. Harmonogramy CWU i cyrkulacji znają tylko poziomy 1 i 2: schemat LLM oferuje wyłącznie te, a strażnik
+zamienia zabłąkany Komfort+ na Komfort, a Komfort− na przerwę ekonomiczną. Przy skracaniu cyrkulacji
+zostają godziny o najsilniejszym zaobserwowanym poborze. Korekty są logowane i publikowane w atrybucie `korekty_regul`
 sensora harmonogramu, a `zrodlo` dostaje dopisek „+ reguły".
 
 ## Weryfikacja hybrydowa

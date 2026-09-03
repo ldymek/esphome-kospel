@@ -580,8 +580,9 @@ class KospelLLM(hass.Hass):
          "goal": ("Nagrzej zasobnik (2) w 1-2 tanszych godzinach TUZ PRZED kazdym klastrem poboru (rano, wieczor) "
                   "oraz w OSTATNIEJ tanszej godzinie przed szczytem cen. W szczycie cen zostaw przerwe (podtrzymanie "
                   "ekonomiczne), NIE poziom 1. Poziom 1 (brak grzania) TYLKO w nocy 00:00-05:00, gdy nikt nie uzywa "
-                  "wody — nigdy w godzinach poboru. Przedzialy Komfort (2): 2-4 sztuki po 1-2 h, LACZNIE max 4 h/dobe "
-                  "(dluzsze = zasobnik trzymany w 45 C caly dzien = drogo). Nigdy jeden dlugi przedzial Komfort.")},
+                  "wody — nigdy w godzinach poboru. Przedzialy Komfort (2): 2-4 sztuki po DOKLADNIE 1 h (zasobnik laduje sie "
+                  "w ~10 min; dluzszy przedzial = podtrzymywanie 45 C = kolejne dogrzewania). W nocy 22:00-05:00 poziom 1 "
+                  "(brak grzania) — zasobnik trzyma cieplo do porannego ladowania.")},
         {"key": "Cyrkulacja", "base": 3360, "sensor": "sensor.kospel_ai_harmonogram_cyrk",
          "levels": ("dla pompy CYRKULACJI CWU: w przedziale pompa krazy (ciepla woda od reki w lazience), "
                     "poza przedzialami stoi (zero strat ciepla w rurach). Poziom zawsze 2."),
@@ -724,9 +725,10 @@ class KospelLLM(hass.Hass):
         pk = eng.peak_block(hours)
         if pk:
             txt += f"- Szczyt cen dzis: {pk[0]:02d}:00-{pk[1]:02d}:00 -> zaladuj zasobnik (2) w ostatniej tanszej godzinie przed nim.\n"
-        txt += ("- CWU: poziom 1 (Ochrona = brak grzania) dozwolony TYLKO 00:00-05:00; w innych godzinach zostanie "
+        txt += ("- CWU: poziom 1 (Ochrona = brak grzania) w nocy 22:00-05:00 (bez poboru); w innych godzinach zostanie "
                 f"zamieniony na podtrzymanie ekonomiczne. Komfort (2) LACZNIE max {P['cwu_komfort_cap_h']} h/dobe w 1-2 h "
-                "przedzialach przed poborem — nadmiar zostanie usuniety. Zasobnik ponizej 35 C wymusza grzanie niezaleznie od ceny.\n")
+                "przedzialach po 1 h przed poborem — nadmiar zostanie usuniety. Zasobnik ponizej 35 C (przy spodziewanym poborze) "
+                "lub 30 C wymusza grzanie niezaleznie od ceny.\n")
         txt += (f"- Cyrkulacja: lacznie max {P['circ_day_cap_h']} h/dobe, w godzinach drogich max {P['circ_exp_cap_h']} h; "
                 "tylko godziny najsilniejszego poboru z profilu.\n"
                 "- Program, ktory lamie te reguly, zostanie automatycznie skorygowany.")
@@ -765,9 +767,12 @@ class KospelLLM(hass.Hass):
                     "Minuty od polnocy (0-1439), start_min < stop_min, rosnaco i bez nakladania.\n\n"
                     "Ceny energii:\n" + curve + self.price_context(prices) + fc + ctx
                     + (usage + self.rules_hint(prices) if tt["key"] in ("CWU", "Cyrkulacja") else ""))
+            schema = json.loads(json.dumps(self.SLOT_SCHEMA))
+            if tt["key"] != "CO":   # DHW / circulation timetables know only levels 1 and 2
+                schema["properties"]["slots"]["items"]["properties"]["level"]["enum"] = [1, 2]
             raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
                                           "You design heating schedules. Output ONLY JSON per schema.",
-                                          user, schema=self.SLOT_SCHEMA, thinking=False, temp=0.1, npredict=400)
+                                          user, schema=schema, thinking=False, temp=0.1, npredict=400)
             try: slots = self.parse_slots(json.loads(raw).get("slots", []))
             except Exception: slots = []
             if slots: plans[tt["key"]] = slots
