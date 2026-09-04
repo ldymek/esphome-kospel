@@ -38,7 +38,19 @@ z twardymi guardrailami.
   poprawić). Plan silnika jest zawsze publikowany do porównania. Suwak preferencji (Oszczędność /
   Balans / Komfort), tryb eco wg obecności, przyciski „za zimno / za ciepło", dzienne oszczędności vs
   taryfa płaska, podsumowanie tygodnia, diagnostyka ciśnienia i degradacji zasobnika oraz backtest
-  jednym kliknięciem — patrz [docs/ENGINE.pl.md](docs/ENGINE.pl.md).
+  jednym kliknięciem — patrz [docs/ENGINE.pl.md](docs/ENGINE.pl.md). Na kotle autora działa w trybie
+  **Hybryda** od 2026-09-04.
+- **Twarde reguły + samonaprawczy strażnik (v2.1)** — cokolwiek wyprodukuje planer (LLM, silnik,
+  poprawka hybrydowa), przechodzi przez `enforce_rules()`, zanim trafi do kotła: normalizacja
+  poziomów CWU (harmonogram CWU zna tylko *brak grzania* i *komfort*), brak grzania wyłącznie
+  w adaptacyjnym oknie nocnym (2 h po ostatnim wieczornym poborze → 05:00), godzinne ładowania
+  w dziennym budżecie (3/4/6 h wg preferencji), ładowanie w ostatniej tańszej godzinie przed
+  prawdziwym szczytem cen (blok ≤5 h wokół maksimum, a nie flaga `is_expensive` Pstryk), cyrkulacja
+  ograniczona na klaster / w szczycie / na dobę oraz **próg zasobnika** (<35 °C przy spodziewanym
+  poborze → podtrzymanie ekonomiczne, <30 °C → grzej teraz niezależnie od ceny). Monitor co 20 s
+  nakłada reguły na program faktycznie zapisany w kotle i w razie potrzeby przepisuje tylko CWU —
+  niezależnie od tego, czy flaga autonomii przeżyła restart HA. Korekty widać w sensorach
+  harmonogramów (`zrodlo`, `korekty_regul`).
 - **Plan mocy wg cen (opt-in)** — kocioł nie ma natywnego harmonogramu mocy, więc AI wypycha
   kroczący plan 24 h do ESP (drogie godziny 12 kW, typowe 20, tanie 24), a ESP wykonuje go
   z lokalnymi guardami nawet przy leżącym HA: próg komfortu, zasobnik poniżej 35 °C (intensywny
@@ -193,6 +205,23 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
   zagłodzić samego Home Assistanta.
 - Sensor alarmu kotła liczony z jeszcze-nieodczytanego rejestru przez chwilę po każdym reboocie
   zwraca śmieci — zabezpiecz NaN i debounce'uj watchdogi, które na nim działają.
+- **Sezon wymaga wcześniej włączonego zasobnika CWU** — zapis lata przy wyłączonym zasobniku po cichu
+  się cofa (patrz docs/CONFIG-FLAGS.md). Słowo `0x0B55` należy do kotła: najpierw warunki, potem sezon.
+- **W harmonogramie CWU poziom 1 znaczy „w ogóle nie grzej zasobnika"**, a nie temperaturę ochronną.
+  Reguła wstawiająca poziom 1 w każdą godzinę oznaczoną przez Pstryk jako droga (tego dnia 13 godzin)
+  wystudziła zasobnik do 20 °C w czasie wieczornych poborów. Nigdy nie opieraj zachowania na
+  względnej fladze dostawcy — sam wylicz prawdziwy szczyt cen i zawsze trzymaj próg temperatury
+  zasobnika.
+- **Podtrzymanie ekonomiczne przez całą noc to impuls 20 kW co ~4 h; 2-godzinny przedział Komfort
+  dodaje kolejny.** Zasobnik ładuje się w ~10 minut, więc przedziały Komfort trwają godzinę, a noc
+  jest oknem bez grzania. Ale okno musi być adaptacyjne: sztywny start 22:00 trafił na kąpiel o 22:15
+  i zostawił wodę 24 °C na 2,5 godziny.
+- **Pilnuj tego, co kocioł faktycznie wykonuje, a nie własnych flag.** Awaria sieci (aktualizacja
+  firmware routera) zgasiła flagę autonomii, choć mapy tygodnia dalej wskazywały program AI; strażnik
+  oparty na fladze stał bezczynnie. Oparty na mapach tygodnia — działa.
+- **Audyt LLM to druga opinia, nie ostatnie słowo.** W trybie hybrydowym wskazał realne problemy, ale
+  też sam sobie zaprzeczył („za dużo bloków Komfort", po czym dodał kolejny). Deterministyczne reguły
+  są ostatnią bramką dla każdego autora.
 
 ## Roadmapa
 

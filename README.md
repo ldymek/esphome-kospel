@@ -36,7 +36,18 @@ and a supervised autonomous mode with hard guardrails.
   the LLM audits and may amend). The engine's plan is always published for comparison. Preference
   slider (Oszczędność / Balans / Komfort), presence-aware eco mode, "too cold / too warm" feedback
   buttons, daily savings vs flat tariff, weekly digest, pressure/tank-degradation diagnostics and a
-  one-click backtest — see [docs/ENGINE.md](docs/ENGINE.md).
+  one-click backtest — see [docs/ENGINE.md](docs/ENGINE.md). Running in **Hybryda** on the author's
+  heater since 2026-09-04.
+- **Hard rules + self-healing guard (v2.1)** — whatever the planner (LLM, engine, hybrid amendment)
+  produces passes `enforce_rules()` before it reaches the heater: DHW levels normalised (the CWU
+  timetable knows only *no heating* and *comfort*), no-heating only in an adaptive night window
+  (2 h after the last observed evening draw → 05:00), 1-hour comfort charges within a daily budget
+  (3/4/6 h by preference), a charge in the last cheaper hour before the day's real price peak
+  (a ≤5 h block around the maximum, not Pstryk's `is_expensive` flag), circulation capped per
+  cluster / in the peak / per day, and a **tank floor** (<35 °C with draws ahead → economic upkeep,
+  <30 °C → heat now regardless of price). A 20-second monitor re-applies the rules to the programme
+  actually on the heater and rewrites only CWU when needed, whether the autonomy flag survived an HA
+  restart or not. Corrections are visible in the schedule sensors (`zrodlo`, `korekty_regul`).
 - **Price-driven power plan (opt-in)** — the heater has no native power schedule, so the AI
   pushes a rolling 24 h plan into the ESP (expensive hours 12 kW, normal 20, cheap 24) and the
   ESP executes it with local guards even with HA down: comfort floor, tank below 35 °C (heavy
@@ -186,6 +197,20 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
   reboot — guard NaN, and debounce watchdogs that act on it.
 - **Season needs the DHW tank enabled first** — writing summer while the tank is off silently
   reverts (see docs/CONFIG-FLAGS.md). The heater owns `0x0B55`; enable preconditions, then season.
+- **In the CWU timetable level 1 means "do not heat the tank at all"**, not a protective
+  temperature. A rule that put level 1 into every hour Pstryk flagged as expensive (13 hours that
+  day) starved the tank to 20 °C during the evening draws. Never gate behaviour on a provider's
+  relative flag — derive the real price peak yourself and always keep a tank-temperature floor.
+- **Economic upkeep all night costs a 20 kW burst every ~4 h; a 2-hour comfort slot adds another.**
+  A tank charges in ~10 minutes, so comfort slots are 1 hour and the night is a no-heating window.
+  But make that window adaptive: a fixed 22:00 start met a 22:15 bath and left 24 °C water for
+  2.5 hours.
+- **Guard on what the heater actually runs, not on your own flags.** A network outage (router
+  firmware upgrade) dropped the autonomy flag while the weekly maps still pointed at the AI programme;
+  a guard keyed on the flag stayed inert. Key it on the weekly maps.
+- **The LLM's audit is a second opinion, not the last word.** In hybrid mode it flagged real issues
+  but also contradicted itself ("too many comfort blocks", then added one). The deterministic rules
+  are the final gate for every author.
 
 ## Roadmap
 
