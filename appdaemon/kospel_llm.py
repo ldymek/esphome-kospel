@@ -677,13 +677,27 @@ class KospelLLM(hass.Hass):
         if verify is not None: attrs["weryfikacja_llm"] = verify
         self.set_state("sensor.kospel_plan_silnika", state=time.strftime("%Y-%m-%d %H:%M"), attributes=attrs)
 
+    def programme8_live(self):
+        """True when the heater actually executes the AI programme 8: autonomy engaged, OR every weekly
+        map already points at 8 (e.g. autonomy dropped by an HA restart while the maps stayed). The
+        guards must protect the tank in both cases."""
+        if self.load_auton().get("active"): return True
+        try:
+            vals = [self.get_state(f"number.kc868_heater_program_{tt}_{d}")
+                    for tt in ("co", "cwu", "cyrkulacji")
+                    for d in ("poniedzialek", "wtorek", "sroda", "czwartek", "piatek", "sobota", "niedziela")]
+            nums = [float(v) for v in vals if v not in (None, "unknown", "unavailable")]
+            return len(nums) >= 15 and all(n == self.AI_PROG_NR for n in nums)
+        except Exception:
+            return False
+
     def cwu_floor_tick(self):
         """Self-healing guard on the ACTIVE CWU program: re-applies eng.enforce_rules (tank floor,
         no 'no-heating' level outside the night, Komfort budget, pre-peak charge) to what is written on
         the heater and rewrites ONLY the CWU program if that changes anything. Runs every tick, acts at
         most once per 45 min, autonomy only, outside the daily LLM write budget."""
         try:
-            if not self.load_auton().get("active"): return
+            if not self.programme8_live(): return
             tank = self.fnum("sensor.kc868_heater_heater_dhw_temp")
             if tank is None: return
             if time.time() - getattr(self, "_floor_ts", 0) < 45 * 60: return
@@ -838,7 +852,8 @@ class KospelLLM(hass.Hass):
                               base=base, starts=starts, stops=stops, idxs=idxs)
             self.count_write(); time.sleep(0.4)
             human = [f"{a//60:02d}:{a%60:02d}-{b//60:02d}:{b%60:02d} {lvl[v]}" for a, b, v in clean]
-            status_txt = "AKTYWNY (autonomia)" if live else "NIEAKTYWNY"
+            status_txt = ("AKTYWNY (autonomia)" if self.load_auton().get("active") else
+                          "AKTYWNY (tydzień wskazuje program 8)") if live else "NIEAKTYWNY"
             self.set_state(tt["sensor"], state=time.strftime("%Y-%m-%d %H:%M"),
                            attributes={"friendly_name": f"Program AI {tt['key']} (8)",
                                        "icon": "mdi:calendar-star", "przedzialy": human,
@@ -857,7 +872,7 @@ class KospelLLM(hass.Hass):
         Silnik (deterministic engine), Hybryda (engine plans, LLM audits/amends). The engine's plan
         is always published to sensor.kospel_plan_silnika for inspection, whatever the mode."""
         mode = self.stt("input_select.kospel_planer", self.PLANER_LLM)
-        live = self.load_auton().get("active", False)
+        live = self.programme8_live()
         engine_out = None
         try: engine_out = self.engine_plan(prices)
         except Exception as ex: self.log(f"engine plan error: {type(ex).__name__} {ex}", level="WARNING")

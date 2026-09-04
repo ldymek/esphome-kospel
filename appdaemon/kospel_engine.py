@@ -177,8 +177,17 @@ PREF = {   # idle = outside comfort windows (None -> heater economic setpoint, c
 # overrides everything (tank < 35 C -> no level 1 for the next hours, < 30 C -> heat now).
 # Lesson 2026-09-03: economic upkeep (39 C) all night = a 20 kW burst every ~4 h; 2 h Komfort slots
 # add another. Night window 22-05 without heating (tank drifts ~40 -> ~33), Komfort slots 1 h each.
-CWU_NIGHT = list(range(22, 24)) + list(range(0, 5))
+CWU_NIGHT = list(range(22, 24)) + list(range(0, 5))   # default; see night_window()
 CWU_FLOOR_ECON, CWU_FLOOR_HEAT = 35.0, 30.0
+
+def night_window(usage):
+    """Hours without DHW heating: from 2 h after the last observed evening draw (>= cluster
+    threshold, never before 22:00) until 05:00. Lesson 2026-09-03: a bath at 22:15 met a fixed
+    22:00 window and the tank sat at 24 C for 2.5 h."""
+    thr = max(1.0, 0.15 * max(usage)) if usage and max(usage) > 0 else 1.0
+    last = max([h for h in range(18, 24) if usage and h < len(usage) and usage[h] >= thr] or [19])
+    start = max(22, last + 2)
+    return [h for h in range(start, 24)] + list(range(0, 5))
 DEFAULT_COMFORT_WINDOWS = [(6, 9), (16, 22)]
 
 def _compress(levels_by_hour, max_slots=5):
@@ -278,7 +287,8 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, 
             elif q[i] == KOMFORT_MINUS: q[i] = None
         if bad: notes.append(f"CWU: poziomy 3/4 nie istnieją dla CWU -> Komfort- usunięty (ekonomicznie), Komfort+ = Komfort (godziny {bad[0]:02d}-{bad[-1]+1:02d})")
         # (a) level 1 (= tank NOT heated) only at night / when away; elsewhere -> economic gap
-        off_ok = set(CWU_NIGHT) if P["cwu_night_off"] else set()
+        night = night_window(usage)
+        off_ok = set(night) if P["cwu_night_off"] else set()
         if away: off_ok = set(range(24))
         thr = max(1.0, 0.15 * max(usage)) if usage and max(usage) > 0 else 1.0   # same threshold as usage_clusters
         def draws(h): return (usage[h] if usage and h < len(usage) else 0.0) >= thr
@@ -337,7 +347,7 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, 
                 if all(q[i] is None for i in range(h * 4, h * 4 + 4)) and not draws(h) and not draws((h + 1) % 24):
                     for i in range(h * 4, h * 4 + 4): q[i] = OCHRONA
                     added.append(h)
-            if added: notes.append(f"CWU: noc {min(CWU_NIGHT[:2]):02d}-{CWU_NIGHT[-1]+1:02d} bez grzania (zasobnik trzyma ciepło do porannego ładowania)")
+            if added: notes.append(f"CWU: noc {night[0]:02d}-05 bez grzania (2 h po ostatnim wieczornym poborze; zasobnik trzyma ciepło do porannego ładowania)")
         # (d) tank floor: cold tank overrides any plan (the economic floor only when draws are ahead)
         if tank_temp is not None and now_hour is not None:
             ahead = any(draws(h % 24) for h in range(now_hour, now_hour + 4))
@@ -478,9 +488,10 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
                 cwu[best] = KOMFORT
                 notes.append(f"CWU: ładowanie o {best:02d}:00 przed szczytem cen {a:02d}-{b:02d} ({price(best)} zł/kWh); w szczycie tylko podtrzymanie ekonomiczne")
         if P["cwu_night_off"]:
-            for h in CWU_NIGHT:
+            night = night_window(usage)
+            for h in night:
                 if cwu[h] is None and not any(hs - 1 <= h <= he for hs, he in cl): cwu[h] = OCHRONA
-            notes.append("CWU: noc 22-05 bez grzania — zasobnik trzyma ciepło do porannego ładowania (bez nocnych dogrzewań)")
+            notes.append(f"CWU: noc {night[0]:02d}-05 bez grzania (2 h po ostatnim wieczornym poborze) — zasobnik trzyma ciepło do porannego ładowania")
     battery_hour = None
     if battery and known:
         hb = min(known, key=lambda h: price(h))

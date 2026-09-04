@@ -69,7 +69,7 @@ and the same rules are spelled out in the LLM prompt with the day's actual peak 
 
 | Rule | Oszczędność | Balans | Komfort |
 |---|---|---|---|
-| CWU level 1 (no heating) | enforced 22:00–05:00 (no draws) | enforced 22:00–05:00 (no draws) | never (away mode only) |
+| CWU level 1 (no heating) | night window (2 h after the last evening draw, ≥22:00, to 05:00) | same | never (away mode only) |
 | CWU in expensive hours | economic maintenance (gap) | same | same |
 | Tank charge before the day's price peak | last cheaper hour before it | same | same |
 | Komfort slots | 1 h each, 3 h/day | 1 h each, 4 h/day | 1 h each, 6 h/day |
@@ -81,7 +81,7 @@ and the same rules are spelled out in the LLM prompt with the day's actual peak 
 level 1 from those hours, below 30 °C forces a Komfort slot for the current hour regardless of price.
 Lesson 2026-09-03: economic upkeep at 39 °C all night meant a 20 kW burst every ~4 h and a 2-hour
 Komfort slot added another, hence the night window and the 1-hour slots (a 200 l tank charges in ~10 min). A separate self-healing monitor
-(`cwu_floor_tick`, every 20 s, at most one write per 45 min) re-applies the rules to the program that is
+(`cwu_floor_tick`, every 20 s, active whenever the heater's weekly maps point at programme 8, autonomy flag or not, at most one write per 45 min) re-applies the rules to the program that is
 actually on the heater and rewrites only the CWU program if that changes anything, outside the daily
 write budget; a cold tank additionally raises a notification. The CWU Komfort budget is 3 / 4 / 6 hours
 a day (Oszczędność / Balans / Komfort), keeping the hours that serve the coming draws.

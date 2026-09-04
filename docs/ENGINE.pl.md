@@ -70,7 +70,7 @@ reguły trafiają do promptu LLM razem z dzisiejszym szczytem cen (`rules_hint`)
 
 | Reguła | Oszczędność | Balans | Komfort |
 |---|---|---|---|
-| Poziom 1 CWU (brak grzania) | wymuszony 22:00–05:00 (bez poboru) | wymuszony 22:00–05:00 (bez poboru) | nigdy (tylko tryb „nikogo w domu") |
+| Poziom 1 CWU (brak grzania) | okno nocne (2 h po ostatnim wieczornym poborze, ≥22:00, do 05:00) | tak samo | nigdy (tylko tryb „nikogo w domu") |
 | CWU w godzinach drogich | podtrzymanie ekonomiczne (przerwa) | tak samo | tak samo |
 | Ładowanie zasobnika przed szczytem cen | ostatnia tańsza godzina przed nim | tak samo | tak samo |
 | Przedziały Komfort | po 1 h, 3 h/dobę | po 1 h, 4 h/dobę | po 1 h, 6 h/dobę |
@@ -83,7 +83,7 @@ czterech godzinach usuwa z nich poziom 1, poniżej 30 °C wymusza przedział Kom
 niezależnie od ceny. Lekcja 2026-09-03: podtrzymanie ekonomiczne 39 °C przez całą noc to impuls 20 kW co
 ~4 h, a 2-godzinny przedział Komfort dodawał kolejny — stąd okno nocne i przedziały 1 h (zasobnik 200 l
 ładuje się w ~10 min). Osobny samonaprawczy monitor
-(`cwu_floor_tick`, co 20 s, najwyżej jeden zapis na 45 min) nakłada reguły na program faktycznie
+(`cwu_floor_tick`, co 20 s, aktywny zawsze, gdy mapy tygodnia kotła wskazują program 8 — niezależnie od flagi autonomii, najwyżej jeden zapis na 45 min) nakłada reguły na program faktycznie
 zapisany w kotle i przepisuje tylko program CWU, jeśli coś się zmienia, poza dziennym budżetem zapisów;
 zimny zasobnik dodatkowo wysyła powiadomienie. Budżet Komfort CWU to 3 / 4 / 6 h na dobę
 (Oszczędność / Balans / Komfort), zostają godziny obsługujące nadchodzący pobór.
