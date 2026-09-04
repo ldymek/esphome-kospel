@@ -337,7 +337,7 @@ class KospelLLM(hass.Hass):
     # can only DOWNGRADE back to shadow. Anti-freeze/disinfection/season are never touched.
     DAYS = ["poniedzialek", "wtorek", "sroda", "czwartek", "piatek", "sobota", "niedziela"]
     AUTON_WEEKLY = ["program_co", "program_cwu", "program_cyrkulacji"]   # timetables autonomy manages (-> program 8)
-    MAX_CONTENT_WRITES_PER_DAY = 12
+    MAX_CONTENT_WRITES_PER_DAY = 16   # 4 scheduled runs x 3 programmes + headroom for restarts
 
     def auton_file(self): return os.path.join(APPDIR, "autonomy.json")
 
