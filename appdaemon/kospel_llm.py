@@ -1104,10 +1104,22 @@ class KospelLLM(hass.Hass):
             self.log(f"backtest error: {type(ex).__name__} {ex}", level="WARNING")
             self.set_state("sensor.kospel_backtest", state="błąd", attributes={"friendly_name": "Backtest silnika (wczoraj)", "blad": str(ex)[:200]})
 
+    LLM_LB = "http://192.168.1.27:11434"
+    def llm_host(self):
+        """Ollama base URL: helper > apps.yaml > LB default. Direct GPU hosts (.20/.21) are rewritten
+        to the load balancer — calling them bypasses failover and lands the 26B on the one machine
+        that spills it to CPU (observed 2026-09-06 after an HA restart re-applied a stale helper)."""
+        h = self.stt("input_text.kospel_llm_host", self.args.get("ollama_host", self.LLM_LB)) or self.LLM_LB
+        if any(x in h for x in ("192.168.1.21", "192.168.1.20")):
+            self.log(f"LLM host {h} is a GPU node, not the LB -> using {self.LLM_LB}", level="WARNING")
+            try: self.call_service("input_text/set_value", entity_id="input_text.kospel_llm_host", value=self.LLM_LB)
+            except Exception: pass
+            h = self.LLM_LB
+        return h.rstrip("/")
+
     def run_once(self):
         cfg = {
-            "host": self.stt("input_text.kospel_llm_host",
-                             self.args.get("ollama_host", "http://192.168.1.27:11434")),
+            "host": self.llm_host(),
             "model": self.stt("input_select.kospel_llm_model", "gemma4:26b-a4b-it-qat"),
             "mode": self.stt("input_select.kospel_llm_tryb", "Doradca (tylko opis)"),
             "thinking": self.stt("input_boolean.kospel_llm_thinking") == "on",
