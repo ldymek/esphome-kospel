@@ -1195,7 +1195,10 @@ class KospelLLM(hass.Hass):
             u["date"] = today; u["today"] = [0]*24
         if is_draw:
             u["today"][int(time.strftime("%H"))] += 1
+            u["total_min"] = int(u.get("total_min", 0)) + 1
         json.dump(u, open(self.dhw_usage_file(), "w"))
+        if is_draw or self.get_state("sensor.kospel_cwu_pobor_licznik") is None:
+            self.publish_draw_counter(u)
         if now - self.dhw_last_publish >= 300:
             self.dhw_last_publish = now
             top = sorted(range(24), key=lambda h: -(u["profile"][h] + u["today"][h]))[:5]
@@ -1221,6 +1224,15 @@ class KospelLLM(hass.Hass):
                                        "metoda": "spadek temp. zasobnika >1.2°C/10 min bez grzania CWU"})
             self.dhw_drift_check(u)
 
+    def publish_draw_counter(self, u):
+        """Monotonic 'minutes of hot-water draw' counter with state_class total_increasing, so the
+        recorder compiles hourly statistics and a native statistics-graph card can draw real usage
+        bars per hour/day (the profile arrays are not a time series). Persisted in dhw_usage.json."""
+        self.set_state("sensor.kospel_cwu_pobor_licznik", state=str(int(u.get("total_min", 0))),
+                       attributes={"friendly_name": "Pobór CWU — licznik minut", "icon": "mdi:water-pump",
+                                   "unit_of_measurement": "min", "state_class": "total_increasing",
+                                   "metoda": "minuty z wykrytym poborem (spadek temp. zasobnika bez grzania)"})
+
     def dhw_load(self):
         u = {}
         try: u = json.load(open(self.dhw_usage_file()))
@@ -1230,6 +1242,8 @@ class KospelLLM(hass.Hass):
         if len(u.get("by_dow", [])) != 7 or any(len(r) != 24 for r in u.get("by_dow", [])):
             u["by_dow"] = [[0.0]*24 for _ in range(7)]
         u.setdefault("date", ""); u.setdefault("last_days", []); u.setdefault("drift_notified", "")
+        if "total_min" not in u:
+            u["total_min"] = int(sum(sum(d) for d in u["last_days"]) + sum(u["today"]))
         return u
 
     def dhw_drift_check(self, u):
