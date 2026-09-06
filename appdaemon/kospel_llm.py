@@ -68,7 +68,8 @@ class KospelLLM(hass.Hass):
     def ollama_chat(self, host, model, system, user, schema=None, thinking=False, temp=0.2, npredict=700):
         body = {"model": model, "stream": False, "think": bool(thinking),
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "options": {"temperature": temp, "num_ctx": 8192, "num_predict": npredict, "repeat_penalty": 1.15}}
+                # no num_ctx: the LLM servers are tuned per model (an override evicts weights from the GPU)
+                "options": {"temperature": temp, "num_predict": npredict, "repeat_penalty": 1.15}}
         if schema: body["format"] = schema
         t = time.time()
         r = self.http_json(host.rstrip("/") + "/api/chat", body, timeout=240)
@@ -1077,7 +1078,7 @@ class KospelLLM(hass.Hass):
     def run_once(self):
         cfg = {
             "host": self.stt("input_text.kospel_llm_host",
-                             self.args.get("ollama_host", "http://192.168.1.21:11434")),
+                             self.args.get("ollama_host", "http://192.168.1.27:11434")),
             "model": self.stt("input_select.kospel_llm_model", "gemma4:26b-a4b-it-qat"),
             "mode": self.stt("input_select.kospel_llm_tryb", "Doradca (tylko opis)"),
             "thinking": self.stt("input_boolean.kospel_llm_thinking") == "on",

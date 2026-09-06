@@ -123,7 +123,9 @@ remove those two tiles or point them at your own sensors if you skip Z-Wave.
 ### 3. Enable the AI caretaker (optional)
 
 1. Run [Ollama](https://ollama.com) somewhere on your LAN and pull a model
-   (e.g. `ollama pull gemma4:26b-a4b-it-qat`).
+   (e.g. `ollama pull gemma4:26b-a4b-it-qat`). A load balancer in front of several Ollama machines
+   (e.g. HAProxy routing by model name) works transparently — the app only needs the base URL. It
+   sends `think: false` and never overrides `num_ctx`, so server-side tuning stays in effect.
 2. Install the **AppDaemon** add-on. Copy `appdaemon/kospel_llm.py` and `apps.yaml.example`
    (as `apps.yaml`) into `/addon_configs/a0d7b954_appdaemon/apps/`.
 3. Configure the app the AppDaemon-canonical way — `apps.yaml` args with `!secret`

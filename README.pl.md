@@ -129,7 +129,9 @@ Z-Wave.
 
 ### 3. Włączenie AI-opiekuna (opcjonalne)
 
-1. Uruchom [Ollama](https://ollama.com) gdzieś w LAN i pobierz model
+1. Uruchom [Ollama](https://ollama.com) gdzieś w LAN (load balancer przed kilkoma maszynami Ollama, np. HAProxy
+   routujący po nazwie modelu, działa przezroczyście — aplikacja potrzebuje tylko bazowego URL; wysyła
+   `think: false` i nigdy nie nadpisuje `num_ctx`) i pobierz model
    (np. `ollama pull gemma4:26b-a4b-it-qat`).
 2. Zainstaluj add-on **AppDaemon**. Skopiuj `appdaemon/kospel_llm.py` i `apps.yaml.example`
    (jako `apps.yaml`) do `/addon_configs/a0d7b954_appdaemon/apps/`.
