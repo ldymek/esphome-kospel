@@ -207,6 +207,11 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
   A tank charges in ~10 minutes, so comfort slots are 1 hour and the night is a no-heating window.
   But make that window adaptive: a fixed 22:00 start met a 22:15 bath and left 24 °C water for
   2.5 hours.
+- **A Home Assistant helper created with an `initial:` value resets to it on every restart.** Our AI-mode
+  select was created that way, so each HA restart silently flipped it from Autonomiczny back to shadow and
+  the app dutifully disengaged "by user" and "restored" a backup that was itself all 8s. Never set
+  `initial` on a helper that holds state you care about, and keep the pre-AI backup when the maps already
+  point at the AI programme.
 - **Guard on what the heater actually runs, not on your own flags.** A network outage (router
   firmware upgrade) dropped the autonomy flag while the weekly maps still pointed at the AI programme;
   a guard keyed on the flag stayed inert. Key it on the weekly maps.

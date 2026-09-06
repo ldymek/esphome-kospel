@@ -218,6 +218,11 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
   dodaje kolejny.** Zasobnik ładuje się w ~10 minut, więc przedziały Komfort trwają godzinę, a noc
   jest oknem bez grzania. Ale okno musi być adaptacyjne: sztywny start 22:00 trafił na kąpiel o 22:15
   i zostawił wodę 24 °C na 2,5 godziny.
+- **Helper Home Assistant utworzony z wartością `initial:` wraca do niej przy każdym restarcie.** Tak był
+  utworzony nasz select trybu AI, więc każdy restart HA po cichu przestawiał go z Autonomiczny na shadow,
+  a aplikacja posłusznie wyłączała autonomię „na życzenie użytkownika" i „przywracała" kopię, która sama
+  była samymi ósemkami. Nie ustawiaj `initial` na helperze trzymającym stan, na którym Ci zależy, i zachowuj
+  kopię sprzed AI, gdy mapy już wskazują program AI.
 - **Pilnuj tego, co kocioł faktycznie wykonuje, a nie własnych flag.** Awaria sieci (aktualizacja
   firmware routera) zgasiła flagę autonomii, choć mapy tygodnia dalej wskazywały program AI; strażnik
   oparty na fladze stał bezczynnie. Oparty na mapach tygodnia — działa.

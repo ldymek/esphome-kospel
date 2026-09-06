@@ -44,6 +44,7 @@ class KospelLLM(hass.Hass):
         self.run_daily(self.fit_models, "03:30:00")
         self.run_daily(self.savings_job, "00:15:00")      # yesterday's counterfactual savings
         self.run_daily(self.diag_job, "04:00:00")         # degradation / drift monitors
+        self.run_in(self.restore_diag, 20)
         self.run_daily(self.weekly_digest, "08:00:00")    # Monday report
         for sc, d in (("script.kospel_za_zimno", 1), ("script.kospel_za_cieplo", -1)):
             self.listen_state(self.override_event, sc, attribute="last_triggered", direction=d)
@@ -427,6 +428,13 @@ class KospelLLM(hass.Hass):
             backup["heater_max_power_index"] = int(float(self.stt("number.kc868_heater_heater_max_power_index")))
         except (TypeError, ValueError):
             pass
+        # If the maps ALREADY point at the AI programme (autonomy dropped by an HA restart while the
+        # heater kept running programme 8), a fresh backup would be all 8s and 'restore' would be a
+        # no-op forever. Keep the genuine pre-AI backup instead.
+        old = a.get("backup") or {}
+        if all(v == self.AI_PROG_NR for k, v in backup.items() if k != "heater_max_power_index") and \
+           old and not all(v == self.AI_PROG_NR for k, v in old.items() if k != "heater_max_power_index"):
+            backup = dict(old); self.log("AUTONOMY: mapy już wskazują program 8 — zachowuję wcześniejszą kopię tygodnia")
         for wk in self.AUTON_WEEKLY:
             for d in self.DAYS:
                 self.call_service("number/set_value",
@@ -1027,14 +1035,33 @@ class KospelLLM(hass.Hass):
         self.call_service("persistent_notification/create", notification_id="kospel_tydzien",
                           title="Kocioł — raport tygodniowy", message=msg)
 
+    def restore_diag(self, kwargs=None):
+        """AppDaemon-created sensors vanish on an HA restart; bring the last diagnostics back."""
+        try:
+            if self.get_state("sensor.kospel_diagnostyka") is None and os.path.exists(os.path.join(APPDIR, "diag.json")):
+                d = json.load(open(os.path.join(APPDIR, "diag.json")))
+                self.set_state("sensor.kospel_diagnostyka", state=d["state"], attributes=d["attributes"])
+                self.log("diagnostics sensor restored after HA restart")
+        except Exception as ex:
+            self.log(f"restore_diag: {ex}", level="WARNING")
+
     def diag_job(self, kwargs=None):
         issues, attrs = [], {}
         try:
             pres = self.fetch_series("sensor.kc868_heater_heater_water_pressure", 168)
-            sl = eng.slope_per_day(pres)
+            # pressure swings ~0.7 bar with water temperature; a leak shows in the DAILY MINIMA
+            # (cold system), so fit the slope on per-day minima and require >= 3 days
+            by_day = {}
+            for ts, v in pres:
+                d = time.strftime("%Y-%m-%d", time.localtime(ts)); by_day[d] = min(v, by_day.get(d, v))
+            mins = [(time.mktime(time.strptime(d, "%Y-%m-%d")), v) for d, v in sorted(by_day.items())]
+            sl = eng.slope_per_day(mins) if len(mins) >= 3 else None
+            if sl is None and len(mins) >= 3:   # slope_per_day wants >= 5 points; do a 2-point fallback
+                sl = (mins[-1][1] - mins[0][1]) / max(1.0, (mins[-1][0] - mins[0][0]) / 86400.0)
             cur = self.fnum("sensor.kc868_heater_heater_water_pressure")
             attrs["cisnienie_bar"] = cur; attrs["cisnienie_trend_bar_dzien"] = round(sl, 3) if sl is not None else None
-            if sl is not None and sl < -0.03: issues.append(f"ciśnienie spada {sl:.3f} bar/dzień — możliwa nieszczelność / naczynie wzbiorcze")
+            attrs["cisnienie_min_dobowe"] = [round(v, 2) for _, v in mins]
+            if sl is not None and sl < -0.03: issues.append(f"ciśnienie (minima dobowe) spada {sl:.3f} bar/dzień — możliwa nieszczelność / naczynie wzbiorcze")
             if cur is not None and cur < 0.8: issues.append(f"niskie ciśnienie {cur:.2f} bar — dopuść wodę")
             e = self.load_engine(); tk = eng.TankModel(e.get("tank"))
             deg = tk.degradation_pct(); attrs["zasobnik_degradacja_pct"] = deg
@@ -1046,6 +1073,8 @@ class KospelLLM(hass.Hass):
         attrs.update({"friendly_name": "Diagnostyka kotła", "icon": "mdi:stethoscope", "uwagi": issues,
                       "sprawdzono": time.strftime("%Y-%m-%d %H:%M")})
         self.set_state("sensor.kospel_diagnostyka", state="UWAGA" if issues else "OK", attributes=attrs)
+        try: json.dump({"state": "UWAGA" if issues else "OK", "attributes": attrs}, open(os.path.join(APPDIR, "diag.json"), "w"))
+        except Exception: pass
         if issues:
             self.call_service("persistent_notification/create", notification_id="kospel_diag",
                               title="Kocioł — diagnostyka", message="\n".join("• " + i for i in issues))
