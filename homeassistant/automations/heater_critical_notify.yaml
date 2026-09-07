@@ -1,9 +1,9 @@
 # Push on critical heater states: alarm, error code, low pressure, AI diagnostics, ESP offline, cold tank, watchdog
 alias: Kocioł — awaria / ciśnienie / zimny zasobnik (push)
-description: 'Krytyczne stany kotła: alarm, kod błędu, niskie ciśnienie (< 0.8 bar
-  przez 10 min), uwaga diagnostyki AI, ESP niedostępny > 10 min, zasobnik < 28 °C
-  przez 20 min, autonomia wyłączona przez watchdog. Replace the notify service with
-  your phone''s (notify.mobile_app_<device>).'
+description: 'Krytyczne stany kotła: alarm, kod błędu, niskie ciśnienie (< 0.75 bar
+  przez 15 min, najwyżej co 6 h — na zimno instalacja schodzi do ~0.7 bar), uwaga
+  diagnostyki AI, ESP niedostępny > 10 min, zasobnik < 28 °C przez 20 min, autonomia
+  wyłączona przez watchdog. Replace the notify service with your phone''s (notify.mobile_app_<device>).'
 mode: queued
 triggers:
 - trigger: state
@@ -20,9 +20,9 @@ triggers:
   id: error
 - trigger: numeric_state
   entity_id: sensor.kc868_heater_heater_water_pressure
-  below: 0.8
+  below: 0.75
   for:
-    minutes: 10
+    minutes: 15
   id: cisnienie
 - trigger: state
   entity_id: sensor.kospel_diagnostyka
@@ -48,6 +48,9 @@ conditions:
 - condition: template
   value_template: '{{ trigger.id != ''autonomia'' or ''watchdog'' in (state_attr(''sensor.kospel_ai_autonomia'',''notatka'')
     or '''') }}'
+- condition: template
+  value_template: '{{ trigger.id != ''cisnienie'' or this.attributes.last_triggered
+    is none or (now() - this.attributes.last_triggered).total_seconds() > 21600 }}'
 variables:
   opis: '{% set t = trigger.id %}{% if t == ''alarm'' %}ALARM kotła: {{ states(''sensor.kc868_heater_heater_error'')
     }}{% elif t == ''error'' %}Błąd kotła: {{ states(''sensor.kc868_heater_heater_error'')
