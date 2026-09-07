@@ -1,0 +1,50 @@
+# TRV battery push notification (Fibaro FGT-001: use the *_battery_level_1 sensors; the root value never refreshes)
+alias: TRV — bateria do ładowania
+description: 'Fibaro Heat Controller: powiadomienie push, gdy bateria (endpoint 1
+  — wartość z roota nigdy się nie odświeża) spadnie poniżej 25% na 30 min, plus codzienne
+  przypomnienie o 18:00, dopóki któraś głowica jest poniżej progu. Replace the notify
+  service with your phone''s (notify.mobile_app_<device>).'
+mode: single
+triggers:
+- trigger: numeric_state
+  entity_id:
+  - sensor.sypialnia_battery_level_1
+  - sensor.balkon_battery_level_1
+  - sensor.homeoffice_battery_level_1
+  - sensor.kuchnia_battery_level_1
+  - sensor.velux_battery_level_1
+  - sensor.wykusz_battery_level_1
+  below: 25
+  for:
+    minutes: 30
+- trigger: time
+  at: '18:00:00'
+variables:
+  prog: 25
+  glowice:
+    sensor.sypialnia_battery_level_1: Sypialnia
+    sensor.balkon_battery_level_1: Balkon
+    sensor.homeoffice_battery_level_1: Home office
+    sensor.kuchnia_battery_level_1: Kuchnia
+    sensor.velux_battery_level_1: Velux
+    sensor.wykusz_battery_level_1: Wykusz
+  niskie: '{% set ns = namespace(l=[]) %}{% for e, n in glowice.items() %}{% set v
+    = states(e) | float(100) %}{% if v < prog %}{% set ns.l = ns.l + [n ~ '' '' ~
+    (v | int) ~ ''%''] %}{% endif %}{% endfor %}{{ ns.l | join('', '') }}'
+conditions:
+- condition: template
+  value_template: '{{ niskie | length > 0 }}'
+actions:
+- action: notify.mobile_app_YOUR_PHONE
+  data:
+    title: Głowice TRV — naładuj baterię
+    message: 'Poniżej {{ prog }}%: {{ niskie }}. Podłącz micro-USB na kilka godzin.'
+    data:
+      tag: trv_bateria
+      group: kociol
+      url: /lovelace-grzejniki/grzejniki
+- action: persistent_notification.create
+  data:
+    notification_id: trv_bateria
+    title: Głowice TRV — naładuj baterię
+    message: 'Poniżej {{ prog }}%: {{ niskie }}'
