@@ -76,6 +76,10 @@
          "name": "Temp. magazynu CWU"
         },
         {
+         "entity": "input_number.kospel_cwu_przed_szczytem_temp",
+         "name": "Ładowanie przed szczytem cen do (45 = wył.; >50 tylko z zaworem)"
+        },
+        {
          "entity": "input_number.kospel_taryfa_plaska",
          "name": "Taryfa płaska do porównań"
         },
@@ -87,7 +91,7 @@
       },
       {
        "type": "markdown",
-       "content": "**LLM** — model językowy projektuje programy (dotychczasowe zachowanie). **Silnik** — deterministyczny planer (model termiczny + profil poboru + ceny). **Hybryda** — silnik planuje, LLM audytuje i może poprawić. Plan silnika jest zawsze publikowany do podglądu, niezależnie od trybu. Magazyn ciepła podnosi temperaturę zasobnika w najtańszej godzinie — **włącz tylko, jeśli masz zawór mieszający** (ryzyko poparzenia)."
+       "content": "**LLM** — model językowy projektuje programy (dotychczasowe zachowanie). **Silnik** — deterministyczny planer (model termiczny + profil poboru + ceny). **Hybryda** — silnik planuje, LLM audytuje i może poprawić. Plan silnika jest zawsze publikowany do podglądu, niezależnie od trybu. **Ładowanie przed szczytem** podnosi nastawę CWU tylko w ostatniej tańszej godzinie przed dziennym szczytem cen (silnik wskazuje godzinę), żeby duży wieczorny pobór nie wymuszał grzania pełną mocą po najdroższej cenie; 45 = wyłączone, powyżej 50 °C wymaga zaworu mieszającego. Magazyn ciepła podnosi temperaturę zasobnika w najtańszej godzinie — **włącz tylko, jeśli masz zawór mieszający** (ryzyko poparzenia)."
       }
      ]
     },

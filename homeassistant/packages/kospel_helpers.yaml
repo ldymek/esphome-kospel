@@ -71,6 +71,13 @@ input_number:
     step: 1
     initial: 60
     unit_of_measurement: "°C"
+  kospel_cwu_przed_szczytem_temp:
+    name: "CWU — ładowanie przed szczytem cen (temp.)"
+    min: 45
+    max: 60
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-chevron-up
   kospel_taryfa_plaska:
     name: "Taryfa płaska (porównanie)"
     min: 0.3

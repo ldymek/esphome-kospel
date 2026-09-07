@@ -118,6 +118,21 @@ atrybut `zrodlo`, więc widać, kto jest autorem aktywnego programu (`Silnik`, `
   trzymać się rozmieszczenia mocy/CWU wg silnika). Pomaga zdecydować, czy przejść z LLM na
   Silnik/Hybrydę.
 
+## Ładowanie przed szczytem i bramka audytu (v2.2)
+
+- **Ładowanie przed szczytem** — `input_number.kospel_cwu_przed_szczytem_temp` (45 °C = wyłączone). W ostatniej
+  tańszej godzinie przed dziennym szczytem cen (silnik publikuje ją jako `godzina_przed_szczytem`) aplikacja
+  podnosi nastawę komfortu CWU do tej wartości i potem ją przywraca, żeby duży wieczorny pobór nie wymuszał
+  grzania pełną mocą po najdroższej cenie (obserwacja: 24 kW po 1,98 zł/kWh). Wartości powyżej 50 °C są
+  obcinane, o ile nie jest włączony przełącznik zaworu mieszającego (ochrona przed poparzeniem).
+- **Bramka audytu** — w Hybrydzie LLM ma zatwierdzać, jeśli nie znajdzie konkretnego, policzalnego błędu, a jego
+  poprawki są przyjmowane tylko wtedy, gdy nie są droższe od planu silnika: średnia cena ładowań CWU w granicach
+  5 % i najwyżej jedna godzina ładowania więcej, cyrkulacja nie wydłużona w szczycie, CO nie cieplejsze w szczycie.
+  Odrzucone poprawki trafiają do `weryfikacja_llm.odrzucone_poprawki`.
+- **Diagnostyka** — niskie ciśnienie oceniane po zimnym minimum dobowym (< 0,75 bar → dopuść wodę do ~1,2 bar),
+  a ESP udostępnia `sensor.…_trv_wiek_danych` (sekundy od ostatniego pakietu UDP z Pi Z-Wave); brak pakietu
+  przez 30 min daje uwagę w diagnostyce.
+
 ## Magazyn ciepła (tylko z zaworem mieszającym)
 
 `input_boolean.kospel_zawor_mieszajacy` + `input_number.kospel_cwu_magazyn_temp` (45–65 °C):

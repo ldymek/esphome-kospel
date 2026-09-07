@@ -306,6 +306,17 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, 
                 best = min(pre, key=lambda h: (price(h), -h))
                 for i in range(best * 4, best * 4 + 4): q[i] = KOMFORT
                 notes.append(f"CWU: dodano ładowanie o {best:02d}:00 przed szczytem cen {a:02d}-{b:02d}")
+        # (b2) coverage: every observed draw cluster needs a Komfort charge in the 4 h before it (or in its
+        #      first hour); planners (LLM amendments especially) tend to strip charges to "save" money
+        if usage and not away:
+            for hs, he in usage_clusters(usage):
+                win = [h for h in range(max(0, hs - 4), hs + 1)]
+                if any(q[i] in (KOMFORT, KOMFORT_PLUS) for h in win for i in range(h * 4, h * 4 + 4)): continue
+                if now_hour is not None and hs < now_hour: continue          # already in the past today
+                cands = [h for h in win if h not in peak and h != hs] or [h for h in win if h != hs] or win
+                best = min(cands, key=lambda h: ((price(h) if price(h) is not None else 9) + 0.03 * (hs - h), -h))
+                for i in range(best * 4, best * 4 + 4): q[i] = KOMFORT
+                notes.append(f"CWU: dodano ładowanie o {best:02d}:00 przed poborem {hs:02d}-{he+1:02d}")
         # (c) Komfort budget: the tank is charged for at most cwu_komfort_cap_h hours a day; keep the
         #     hours that serve the coming draws (usage in the next 3 h), the pre-peak charge, and 'now'
         komf_h = sorted({i // 4 for i in range(96) if q[i] in (KOMFORT, KOMFORT_PLUS)})
@@ -479,6 +490,7 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
     # expensive hours: Ochrona instead of the economic setpoint (no hourly top-ups in the peak);
     # make sure a Komfort charge sits in the last non-expensive hours before each peak block that
     # overlaps (or is followed within 2 h by) a draw cluster.
+    prepeak_hour = None
     if not away:
         if pk:
             a, b = pk
@@ -487,6 +499,8 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
                 best = min(pre, key=lambda k: (price(k), -k))
                 cwu[best] = KOMFORT
                 notes.append(f"CWU: ładowanie o {best:02d}:00 przed szczytem cen {a:02d}-{b:02d} ({price(best)} zł/kWh); w szczycie tylko podtrzymanie ekonomiczne")
+            existing = [k for k in range(max(0, a - 3), a) if cwu[k] == KOMFORT]
+            if existing: prepeak_hour = max(existing)   # the charge closest to the peak may be boosted (see app)
         if P["cwu_night_off"]:
             night = night_window(usage)
             for h in night:
@@ -530,7 +544,7 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
         elif cheap(h): power.append(t_cheap)
         else: power.append(t_norm)
     return {"CO": co_slots, "CWU": cwu_slots, "Cyrkulacja": circ_slots, "power_plan": power,
-            "rationale": notes, "pref": pref, "away": away, "battery_hour": battery_hour,
+            "rationale": notes, "pref": pref, "away": away, "battery_hour": battery_hour, "prepeak_hour": prepeak_hour,
             "model": {"thermal_ok": bool(thermal and thermal.ok()), "tau_h": thermal.tau_h() if thermal and thermal.ok() else None,
                       "tank_rate_per_kw": tank.rate_per_kw if tank else None}}
 

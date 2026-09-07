@@ -115,6 +115,21 @@ attribute so you can see who authored the program that is live (`Silnik`, `LLM`,
   engine's plan for that day and publishes `sensor.kospel_backtest` (real cost vs cost if the engine's
   power/CWU placement had been followed). Use it to decide whether to move from LLM to Silnik/Hybryda.
 
+## Pre-peak boost and the audit gate (v2.2)
+
+- **Pre-peak boost** — `input_number.kospel_cwu_przed_szczytem_temp` (45 °C = off). In the last cheaper hour
+  before the day's price peak (the engine publishes it as `godzina_przed_szczytem`) the app raises the DHW
+  comfort setpoint to this value and restores it afterwards, so a large evening draw does not force a
+  full-power recovery at the peak price (observed: 24 kW at 1.98 PLN/kWh). Values above 50 °C are clamped
+  unless the mixing-valve toggle is on (scald guard).
+- **Audit gate** — in Hybryda the LLM is told to approve unless it finds a concrete, quantified error, and
+  its amendments are accepted only if they are not dearer than the engine plan: CWU mean charge price within
+  5 % and at most one extra charge hour, circulation not extended in the peak, CO not warmer in the peak.
+  Rejected amendments are listed in `weryfikacja_llm.odrzucone_poprawki`.
+- **Diagnostics** — low pressure is judged on the cold daily minimum (< 0.75 bar → top up to ~1.2 bar), and
+  the ESP exposes `sensor.…_trv_wiek_danych` (seconds since the last UDP packet from the Z-Wave Pi); no
+  packet for 30 min raises a diagnostics remark.
+
 ## Heat battery (mixing valve only)
 
 `input_boolean.kospel_zawor_mieszajacy` + `input_number.kospel_cwu_magazyn_temp` (45–65 °C):

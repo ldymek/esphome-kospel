@@ -626,7 +626,10 @@ class KospelLLM(hass.Hass):
         e = self.load_engine()
         pref = self.stt("input_select.kospel_preferencja", "Balans")
         if pref not in eng.PREF: pref = "Balans"
-        return {"pref": pref, "battery": self.stt("input_boolean.kospel_zawor_mieszajacy") == "on",
+        boost = self.fnum("input_number.kospel_cwu_przed_szczytem_temp", 45.0) or 45.0
+        valve = self.stt("input_boolean.kospel_zawor_mieszajacy") == "on"
+        if boost > 50.0 and not valve: boost = 50.0     # scald guard: above 50 C only with a mixing valve
+        return {"pref": pref, "battery": valve, "boost_temp": boost,
                 "battery_temp": self.fnum("input_number.kospel_cwu_magazyn_temp", 60.0),
                 "bias": e.get("bias", [0.0] * 24), "flat": self.fnum("input_number.kospel_taryfa_plaska", 1.10)}
 
@@ -682,7 +685,7 @@ class KospelLLM(hass.Hass):
                  "model_termiczny_ok": bool(m.get("thermal_ok")),
                  "stala_czasowa_h": round(m["tau_h"], 1) if m.get("tau_h") else None,
                  "zasobnik_K_h_na_kW": m.get("tank_rate_per_kw"),
-                 "godzina_magazynu": out.get("battery_hour")}
+                 "godzina_magazynu": out.get("battery_hour"), "godzina_przed_szczytem": out.get("prepeak_hour")}
         if verify is not None: attrs["weryfikacja_llm"] = verify
         self.set_state("sensor.kospel_plan_silnika", state=time.strftime("%Y-%m-%d %H:%M"), attributes=attrs)
 
@@ -817,13 +820,13 @@ class KospelLLM(hass.Hass):
         curve = "\n".join(f"{r['t_local']}: {r['full']} zl/kWh" + (" TANIO" if r["cheap"] else "")
                           + (" DROGO" if r["exp"] else "") for r in prices["curve"])
         fc = ("\nPrognoza pogody:\n" + "\n".join(forecast)) if forecast else ""
-        user = ("Silnik deterministyczny zaproponowal programy dzienne kotla. Zweryfikuj je jako ekspert: "
-                "czy sa bezpieczne (komfort, brak grzania w drogich godzinach bez potrzeby, CWU naladowane PRZED drogim "
-                "blokiem i na Ochronie W drogim bloku, cyrkulacja krotka i tylko przy realnym poborze), "
-                "spojne z cenami i pogoda. Jesli plan jest dobry -> zatwierdzam=true, uwagi krotkie. "
-                "Jesli widzisz KONKRETNY blad, podaj poprawiony program w 'poprawki' (tylko dla tej tabeli, "
-                "max 5 przedzialow, minuty 0-1439, poziomy 1=Ochrona 2=Komfort 3=Komfort- 4=Komfort+). "
-                "Nie przepisuj planu bez powodu.\n\n"
+        user = ("Silnik deterministyczny zaproponowal programy dzienne kotla. Jestes AUDYTOREM, nie planista. "
+                "Kryteria: zatwierdzam=true, jesli NIE znajdujesz konkretnego, policzalnego bledu (godzina + cena/pobor), "
+                "ktory pogorszylby koszt lub komfort. Uwagi stylistyczne, 'mozna lepiej', albo reguly, ktore i tak "
+                "wymusza system (noc bez grzania, limit Komfort, cyrkulacja w szczycie), NIE sa powodem odmowy. "
+                "Poprawki tylko gdy zatwierdzam=false, tylko dla tabeli z bledem, i tylko TANSZE lub bezpieczniejsze niz "
+                "plan silnika (podaj godzine i cene w uwagach). Max 5 przedzialow, minuty 0-1439, poziomy "
+                "1=Ochrona(brak grzania) 2=Komfort; dla CO takze 3=Komfort- 4=Komfort+.\n\n"
                 f"PLAN SILNIKA (preferencja {out.get('pref')}, nikogo w domu={out.get('away')}):\n"
                 f"CO: {eng.human(out['CO'])}\nCWU: {eng.human(out['CWU'])}\nCyrkulacja: {eng.human(out['Cyrkulacja'])}\n"
                 "Uzasadnienie silnika:\n- " + "\n- ".join(out.get("rationale", [])) + "\n\n"
@@ -838,12 +841,46 @@ class KospelLLM(hass.Hass):
             self.log(f"hybrid verify failed: {ex}", level="WARNING")
             return {"zatwierdzam": None, "uwagi": ["weryfikacja LLM niedostepna"]}, {}
         adj = {}
+        hours = self.hours_from_prices(prices)
+        def price(h): return (hours[h] or {}).get("price") if hours[h] else None
+        pk = eng.peak_block(hours); peak = set(range(pk[0], pk[1])) if pk else set()
+        def komf_hours(slots): return sorted({i // 4 for i in range(96) if eng._to_quarters(slots)[i] in (eng.KOMFORT, eng.KOMFORT_PLUS)})
+        def mean_price(hs):
+            ps = [price(h) for h in hs if price(h) is not None]
+            return sum(ps) / len(ps) if ps else None
+        rejected = []
         for k, slots in (v.get("poprawki") or {}).items():
             if k in ("CO", "CWU", "Cyrkulacja") and slots:
                 clean = self.parse_slots(slots)
-                if clean and clean != out[k]: adj[k] = clean
+                if not clean or clean == out[k]: continue
+                # programmatic acceptance gate: an amendment must not be dearer than the engine plan
+                if k == "CWU":
+                    e_h, a_h = komf_hours(out[k]), komf_hours(clean)
+                    e_p, a_p = mean_price(e_h), mean_price(a_h)
+                    if a_p is not None and e_p is not None and (a_p > e_p * 1.05 or len(a_h) > len(e_h) + 1):
+                        rejected.append(f"CWU: poprawka LLM droższa (śr. {a_p:.2f} vs {e_p:.2f} zł/kWh, {len(a_h)} vs {len(e_h)} h) — zostaje plan silnika"); continue
+                    # coverage: the amendment must keep a charge before every draw cluster the engine covered
+                    # and the pre-peak charge (the whole point of the plan)
+                    u = self.dhw_load(); usage = [round(p + t_, 1) for p, t_ in zip(u["profile"], u["today"])]
+                    def covered(hs_list):
+                        return {hs for hs, he in eng.usage_clusters(usage) if any(max(0, hs - 4) <= h <= hs for h in hs_list)}
+                    lost = covered(e_h) - covered(a_h)
+                    pre_lost = pk and any(pk[0] - 3 <= h < pk[0] for h in e_h) and not any(pk[0] - 3 <= h < pk[0] for h in a_h)
+                    if lost or pre_lost:
+                        rejected.append("CWU: poprawka LLM usuwa ładowanie przed poborem " + (", ".join(f"{h:02d}:00" for h in sorted(lost)) if lost else "szczytem cen") + " — zostaje plan silnika"); continue
+                if k == "Cyrkulacja":
+                    q = eng._to_quarters(clean); in_peak = sum(1 for i in range(96) if q[i] is not None and i // 4 in peak) / 4
+                    qe = eng._to_quarters(out[k]); in_peak_e = sum(1 for i in range(96) if qe[i] is not None and i // 4 in peak) / 4
+                    if in_peak > in_peak_e + 0.25:
+                        rejected.append(f"Cyrkulacja: poprawka LLM dodaje krążenie w szczycie ({in_peak:g} h vs {in_peak_e:g} h) — zostaje plan silnika"); continue
+                if k == "CO":
+                    q = eng._to_quarters(clean); qe = eng._to_quarters(out[k])
+                    warmer = sum(1 for i in range(96) if i // 4 in peak and (q[i] or 0) in (eng.KOMFORT, eng.KOMFORT_PLUS) and (qe[i] or 0) not in (eng.KOMFORT, eng.KOMFORT_PLUS))
+                    if warmer > 4:
+                        rejected.append(f"CO: poprawka LLM grzeje cieplej w szczycie cen ({warmer/4:g} h) — zostaje plan silnika"); continue
+                adj[k] = clean
         verify = {"zatwierdzam": v.get("zatwierdzam"), "uwagi": v.get("uwagi", [])[:5],
-                  "poprawione": list(adj.keys()), "czas_s": round(dt, 1)}
+                  "poprawione": list(adj.keys()), "odrzucone_poprawki": rejected, "czas_s": round(dt, 1)}
         self.log(f"hybrid verify: {verify}")
         return verify, adj
 
@@ -969,15 +1006,22 @@ class KospelLLM(hass.Hass):
         comfort setpoint to the storage temperature, restore afterwards."""
         pr = self.prefs(); a = self.load_auton(); hour = datetime.datetime.now().hour
         plan = self._last_plan or {}
-        want = (pr["battery"] and plan.get("battery_hour") == hour
-                and self.stt("switch.kc868_heater_zasobnik_cwu_wlaczony") == "on")
+        tank_on = self.stt("switch.kc868_heater_zasobnik_cwu_wlaczony") == "on"
+        want_batt = pr["battery"] and plan.get("battery_hour") == hour and tank_on
+        # pre-peak boost: in the last cheaper hour before the price peak charge the tank higher than
+        # the comfort setpoint, so a big evening draw does not force a full-power recovery at the
+        # peak price (observed 2026-09-06/07: 24 kW at 1.98 zl/kWh). Off while the helper is at 45 C.
+        want_boost = (plan.get("prepeak_hour") == hour and tank_on and not self.presence_away()
+                      and pr["boost_temp"] > (self.fnum("number.kc868_heater_heater_dhw_comfort_temp") or 99))
+        want = want_batt or want_boost
+        target = pr["battery_temp"] if want_batt else pr["boost_temp"]
         ent = "number.kc868_heater_heater_dhw_comfort_temp"
         if want and a.get("battery_orig") is None:
             orig = self.fnum(ent)
             if orig is None: return
             a["battery_orig"] = orig; self.save_auton(a)
-            self.call_service("number/set_value", entity_id=ent, value=min(65.0, max(orig, pr["battery_temp"])))
-            self.log(f"AUTONOMY: magazyn ciepla CWU {orig} -> {pr['battery_temp']} C (godz. {hour})")
+            self.call_service("number/set_value", entity_id=ent, value=min(65.0, max(orig, target)))
+            self.log(f"AUTONOMY: {'magazyn ciepla' if want_batt else 'ladowanie przed szczytem'} CWU {orig} -> {target} C (godz. {hour})")
         elif not want and a.get("battery_orig") is not None:
             self.call_service("number/set_value", entity_id=ent, value=a["battery_orig"])
             self.log(f"AUTONOMY: magazyn ciepla koniec -> CWU komfort {a['battery_orig']} C")
@@ -1062,7 +1106,10 @@ class KospelLLM(hass.Hass):
             attrs["cisnienie_bar"] = cur; attrs["cisnienie_trend_bar_dzien"] = round(sl, 3) if sl is not None else None
             attrs["cisnienie_min_dobowe"] = [round(v, 2) for _, v in mins]
             if sl is not None and sl < -0.03: issues.append(f"ciśnienie (minima dobowe) spada {sl:.3f} bar/dzień — możliwa nieszczelność / naczynie wzbiorcze")
-            if cur is not None and cur < 0.8: issues.append(f"niskie ciśnienie {cur:.2f} bar — dopuść wodę")
+            cold = mins[-1][1] if mins else cur
+            if cold is not None and cold < 0.75: issues.append(f"niskie ciśnienie na zimno {cold:.2f} bar (limit kotła 0.8) — dopuść wodę do ~1.2 bar")
+            age = self.fnum("sensor.kc868_heater_trv_wiek_danych")
+            if age is not None and age > 1800: issues.append(f"brak danych z TRV od {age/60:.0f} min — sprawdź agenta Z-Wave na Pi (UDP do ESP)")
             e = self.load_engine(); tk = eng.TankModel(e.get("tank"))
             deg = tk.degradation_pct(); attrs["zasobnik_degradacja_pct"] = deg
             if deg is not None and deg > 20: issues.append(f"zasobnik grzeje się o {deg:.0f}% wolniej niż na początku — kamień / grzałka")

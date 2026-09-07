@@ -115,7 +115,7 @@ wifi:
   power_save_mode: none
   # Static IP (no DHCP dependency; .221-.223 = the three ESPHome nodes). The MikroTik still
   # holds a stale .134 reservation for this MAC — harmless, device never DHCPs.
-  manual_ip:                 # EDIT ME: your network
+  manual_ip:
     static_ip: 192.168.1.221
     gateway: 192.168.1.1
     subnet: 255.255.255.0
@@ -840,6 +840,19 @@ out.append('''  - platform: template
     accuracy_decimals: 1
     update_interval: 60s
     lambda: 'return id(trv_min_temp);'
+  - platform: template
+    name: "TRV wiek danych"
+    id: trv_wiek_danych
+    unit_of_measurement: "s"
+    icon: mdi:timer-sand
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      // seconds since the last UDP packet from the Z-Wave Pi (heartbeat for the TRV feed);
+      // NAN until the first packet after boot
+      if (id(trv_last_ok) == 0) return NAN;
+      return (float) ((millis() - id(trv_last_ok)) / 1000UL);
   - platform: wifi_signal
     name: "WiFi RSSI"
     update_interval: 60s''')
