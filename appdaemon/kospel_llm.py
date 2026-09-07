@@ -284,7 +284,7 @@ class KospelLLM(hass.Hass):
                 "tryb": self.stt(f"climate.{r}"),
                 "okno_otwarte": self.stt(f"sensor.{r}_open_window_detected") == "True",
                 "grzeje": self.stt(f"sensor.{r}_provide_heat") == "True",
-                "bateria_pct": self.stt(f"sensor.{r}_battery_level"),
+                "bateria_pct": self.stt(f"sensor.{r}_battery_level_1", self.stt(f"sensor.{r}_battery_level")),   # endpoint 1 = live value (root is stale)
             }
         snap["pokoje_TRV"] = rooms
         snap["dom_srednia_C"] = self.stt("sensor.dom_temperatura_srednia")
