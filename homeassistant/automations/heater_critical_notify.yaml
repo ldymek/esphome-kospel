@@ -1,0 +1,83 @@
+# Push on critical heater states: alarm, error code, low pressure, AI diagnostics, ESP offline, cold tank, watchdog
+alias: Kocioł — awaria / ciśnienie / zimny zasobnik (push)
+description: 'Krytyczne stany kotła: alarm, kod błędu, niskie ciśnienie (< 0.8 bar
+  przez 10 min), uwaga diagnostyki AI, ESP niedostępny > 10 min, zasobnik < 28 °C
+  przez 20 min, autonomia wyłączona przez watchdog. Replace the notify service with
+  your phone''s (notify.mobile_app_<device>).'
+mode: queued
+triggers:
+- trigger: state
+  entity_id: binary_sensor.kc868_heater_heater_alarm
+  to: 'on'
+  for:
+    minutes: 2
+  id: alarm
+- trigger: template
+  value_template: '{{ states(''sensor.kc868_heater_heater_error'') not in [''OK'',''unknown'',''unavailable'','''']
+    }}'
+  for:
+    minutes: 2
+  id: error
+- trigger: numeric_state
+  entity_id: sensor.kc868_heater_heater_water_pressure
+  below: 0.8
+  for:
+    minutes: 10
+  id: cisnienie
+- trigger: state
+  entity_id: sensor.kospel_diagnostyka
+  to: UWAGA
+  id: diag
+- trigger: state
+  entity_id: sensor.kc868_heater_heater_dhw_temp
+  to: unavailable
+  for:
+    minutes: 10
+  id: esp
+- trigger: numeric_state
+  entity_id: sensor.kc868_heater_heater_dhw_temp
+  below: 28
+  for:
+    minutes: 20
+  id: zimny
+- trigger: state
+  entity_id: sensor.kospel_ai_autonomia
+  to: nieaktywna
+  id: autonomia
+conditions:
+- condition: template
+  value_template: '{{ trigger.id != ''autonomia'' or ''watchdog'' in (state_attr(''sensor.kospel_ai_autonomia'',''notatka'')
+    or '''') }}'
+variables:
+  opis: '{% set t = trigger.id %}{% if t == ''alarm'' %}ALARM kotła: {{ states(''sensor.kc868_heater_heater_error'')
+    }}{% elif t == ''error'' %}Błąd kotła: {{ states(''sensor.kc868_heater_heater_error'')
+    }} (kod {{ states(''sensor.kc868_heater_heater_error_code'') }}){% elif t == ''cisnienie''
+    %}Niskie ciśnienie w instalacji: {{ states(''sensor.kc868_heater_heater_water_pressure'')
+    }} bar (limit 0.8) — dopuść wodę do ~1.2 bar{% elif t == ''diag'' %}Diagnostyka
+    AI: {{ (state_attr(''sensor.kospel_diagnostyka'',''uwagi'') or []) | join('';
+    '') }}{% elif t == ''esp'' %}Sterownik ESP kotła niedostępny od 10 min — sprawdź
+    zasilanie / WiFi{% elif t == ''zimny'' %}Zimny zasobnik CWU: {{ states(''sensor.kc868_heater_heater_dhw_temp'')
+    }} °C od 20 min — brak ciepłej wody{% else %}Autonomia AI wyłączona przez watchdog:
+    {{ state_attr(''sensor.kospel_ai_autonomia'',''notatka'') }}{% endif %}'
+actions:
+- action: notify.mobile_app_YOUR_PHONE
+  data:
+    title: Kocioł — uwaga
+    message: '{{ opis }}'
+    data:
+      tag: kociol_{{ trigger.id }}
+      group: kociol
+      url: /lovelace-grzejniki/kociol
+      push:
+        sound:
+          name: default
+          critical: 1
+          volume: 0.8
+        interruption-level: time-sensitive
+      channel: alarm
+      importance: high
+- action: persistent_notification.create
+  data:
+    notification_id: kociol_{{ trigger.id }}
+    title: Kocioł — uwaga
+    message: '{{ opis }}'

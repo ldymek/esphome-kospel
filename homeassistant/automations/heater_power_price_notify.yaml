@@ -1,0 +1,33 @@
+# Push when the heater draws >= 20 kW while electricity is expensive (mirrors the wall-panel gauge)
+alias: Kocioł — duża moc przy drogim prądzie (push)
+description: 'To samo, co pokazuje panel ścienny (wskaźnik mocy czerwony od 20 kW
+  + cena): kocioł grzeje ≥ 20 kW przez 5 min, gdy prąd jest drogi (flaga Pstryk lub
+  cena ≥ 1.2 zł/kWh). Najwyżej raz na godzinę. Replace the notify service with your
+  phone''s (notify.mobile_app_<device>).'
+mode: single
+triggers:
+- trigger: numeric_state
+  entity_id: sensor.kc868_heater_heater_power_now
+  above: 19.9
+  for:
+    minutes: 5
+conditions:
+- condition: template
+  value_template: '{{ state_attr(''sensor.kospel_cena_zakupu_teraz'',''drogo_teraz'')
+    in [true, ''true'', ''True''] or states(''sensor.kospel_cena_zakupu_teraz'') |
+    float(0) >= 1.2 }}'
+- condition: template
+  value_template: '{{ this.attributes.last_triggered is none or (now() - this.attributes.last_triggered).total_seconds()
+    > 3600 }}'
+actions:
+- action: notify.mobile_app_YOUR_PHONE
+  data:
+    title: Kocioł grzeje pełną mocą przy drogim prądzie
+    message: '{{ states(''sensor.kc868_heater_heater_power_now'') | round(0) }} kW
+      przy {{ states(''sensor.kospel_cena_zakupu_teraz'') }} zł/kWh ({{ states(''sensor.kc868_heater_heater_status'')
+      }}, zasobnik {{ states(''sensor.kc868_heater_heater_dhw_temp'') | round(0) }}
+      °C). {{ states(''sensor.kospel_rada_urzadzenia'') }}'
+    data:
+      tag: kociol_moc
+      group: kociol
+      url: /lovelace-grzejniki/kociol
