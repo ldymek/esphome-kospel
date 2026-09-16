@@ -103,7 +103,7 @@ api:
                 id(cmg3),(uint16_t)base,15,regs));
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption: {}   # authenticated/encrypted with the API key (plaintext OTA removed in 2027.3)
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
@@ -311,7 +311,7 @@ CONTROLS = [
  ("heater",0x0B79,"disinfection_duration","Dezynfekcja czas trwania",5,180,5,1,"min"),
  # C.MG3 (0x69) — writable via ESP (auto-poll). curve_number/max_supply/hand_temp hold as plain
  # single writes. curve_shift (0x0B61) latches ONLY when bundled with curve_number+flag -> handled
- # by CMG3_CURVE_BUNDLE below, not here. C.MG3 rejects wide reads -> force_new_range.
+ # by CMG3_CURVE_BUNDLE below, not here. C.MG3 rejects wide reads -> reuse_previous_range: false on EVERY C.MG3 entity (each register isolated).
  ("cmg3",0x0B60,"cmg3_curve_number","C.MG3 heating curve number",0,20,1,1,None),
  ("cmg3",0x0B61,"cmg3_curve_shift","C.MG3 heating curve shift",-5,5,0.5,10,"°C"),
  ("cmg3",0x0B57,"cmg3_max_supply","C.MG3 max circuit supply",20,80,0.5,10,"°C"),
@@ -785,7 +785,7 @@ out.append(f"""  - platform: modbus_controller
     address: 0x0B54
     value_type: U_WORD
     entity_category: diagnostic
-    force_new_range: true
+    reuse_previous_range: false
     filters:
       {swap_uint()}
     on_value:
@@ -804,7 +804,7 @@ for dev,reg,idn,name,vmin,vmax,step,scale,unit in CONTROLS:
     address: 0x{reg:04X}
     value_type: U_WORD
     entity_category: diagnostic"""
-    if dev=="cmg3": s+="\n    force_new_range: true"   # C.MG3 rejects wide coalesced reads
+    if dev=="cmg3": s+="\n    reuse_previous_range: false"   # C.MG3 rejects wide coalesced reads (flag on every cmg3 entity = isolated ranges)
     if unit: s+=f'\n    unit_of_measurement: "{unit}"'
     s+=f"\n    filters:\n      {swap_signed(sc,False)}"
     # sync the writable control to the live device value (publish_state does NOT fire set_action),
@@ -819,7 +819,7 @@ for dev,reg,idn,name,opts in SELECTS:
     register_type: holding
     address: 0x{reg:04X}
     value_type: U_WORD
-    entity_category: diagnostic{chr(10)+'    force_new_range: true' if dev=='cmg3' else ''}
+    entity_category: diagnostic{chr(10)+'    reuse_previous_range: false' if dev=='cmg3' else ''}
     filters:
       {swap_uint()}"""
     chain="".join(('if' if i==0 else 'else if')+f'(i=={i}) id({idn}_set).publish_state("{o}"); ' for i,o in enumerate(opts))
