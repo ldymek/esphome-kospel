@@ -127,7 +127,8 @@ remove those two tiles or point them at your own sensors if you skip Z-Wave.
    (e.g. HAProxy routing by model name) works transparently — the app only needs the base URL. It
    sends `think: false` and never overrides `num_ctx`, so server-side tuning stays in effect.
 2. Install the **AppDaemon** add-on. Copy `appdaemon/kospel_llm.py` and `apps.yaml.example`
-   (as `apps.yaml`) into `/addon_configs/a0d7b954_appdaemon/apps/`.
+   (as `apps.yaml`) into the AppDaemon add-on's `apps/` folder (`/addon_configs/a0d7b954_appdaemon/apps/`,
+   or `/app_configs/...` as seen from Terminal & SSH 10.5.0+).
 3. Configure the app the AppDaemon-canonical way — `apps.yaml` args with `!secret`
    (see `apps.yaml.example` + `secrets.yaml.example`): `ollama_host` and `pstryk_api_key`.
    The **Ustawienia** dashboard view offers runtime overrides on top (a password-type

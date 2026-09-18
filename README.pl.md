@@ -134,7 +134,8 @@ Z-Wave.
    `think: false` i nigdy nie nadpisuje `num_ctx`) i pobierz model
    (np. `ollama pull gemma4:26b-a4b-it-qat`).
 2. Zainstaluj add-on **AppDaemon**. Skopiuj `appdaemon/kospel_llm.py` i `apps.yaml.example`
-   (jako `apps.yaml`) do `/addon_configs/a0d7b954_appdaemon/apps/`.
+   (jako `apps.yaml`) do folderu `apps/` add-onu AppDaemon (`/addon_configs/a0d7b954_appdaemon/apps/`,
+   albo `/app_configs/...` widziane z add-onu Terminal & SSH 10.5.0+).
 3. Skonfiguruj aplikację kanonicznie po AppDaemonowemu — argumenty w `apps.yaml` z `!secret`
    (patrz `apps.yaml.example` + `secrets.yaml.example`): `ollama_host` i `pstryk_api_key`.
    Widok **Ustawienia** na dashboardzie daje nadpisania działające od ręki (pole typu password

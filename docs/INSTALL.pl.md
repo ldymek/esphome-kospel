@@ -105,7 +105,8 @@ Upewnij się, że Ollama nasłuchuje w LAN (`OLLAMA_HOST=0.0.0.0`), potem sprawd
 ## 6. AI-opiekun — aplikacja AppDaemon
 
 1. Zainstaluj add-on **AppDaemon** (Ustawienia → Dodatki → sklep). Uruchom go raz.
-2. Jego konfiguracja mieszka w `/addon_configs/a0d7b954_appdaemon/` (dostępne przez add-ony
+2. Jego konfiguracja mieszka w `/addon_configs/a0d7b954_appdaemon/` — add-on Terminal & SSH 10.5.0+ montuje ten
+   sam folder jako `/app_configs/...` (dostępne przez add-ony
    Samba/SSH — poziom *wyżej* niż `/config`).
 3. Skopiuj do `…/apps/`: `appdaemon/kospel_llm.py` oraz `apps.yaml` i `secrets.yaml` zrobione
    z plików `.example` (host Ollamy; klucz API Pstryka z pstryk.pl → Integracje → API, jeśli

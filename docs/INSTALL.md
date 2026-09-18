@@ -105,7 +105,8 @@ Make sure Ollama listens on the LAN (`OLLAMA_HOST=0.0.0.0`), then check from any
 ## 6. AI caretaker — AppDaemon app
 
 1. Install the **AppDaemon** add-on (Settings → Add-ons → store). Start it once.
-2. Its config lives in `/addon_configs/a0d7b954_appdaemon/` (reachable via the Samba/SSH
+2. Its config lives in `/addon_configs/a0d7b954_appdaemon/` — the Terminal & SSH add-on 10.5.0+ mounts the
+   same folder as `/app_configs/...` (reachable via the Samba/SSH
    add-ons — one level *above* `/config`).
 3. Copy into `…/apps/`: `appdaemon/kospel_llm.py`, plus `apps.yaml` and `secrets.yaml` made
    from the two `.example` files (Ollama host; Pstryk API key from pstryk.pl → Integracje → API
