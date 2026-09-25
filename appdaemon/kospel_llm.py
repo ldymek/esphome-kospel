@@ -419,6 +419,46 @@ class KospelLLM(hass.Hass):
                                   f"ustaw dzień na 8 w Programy {tt['key']} lub tryb Autonomiczny")
             self.set_state(tt["sensor"], state=cur["state"], attributes=attrs)
 
+    WK_LABEL = {"program_co": "CO (kocioł)", "program_cwu": "Ciepła woda", "program_cyrkulacji": "Cyrkulacja",
+                "program_c_mg3": "Ogrzewanie (C.MG3)"}
+    DAY_SHORT = ["pn", "wt", "śr", "cz", "pt", "sb", "nd"]
+    DAY_NAME = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
+
+    def day_runs(self, vals):
+        """[1,1,1,1,1,2,2] -> 'program 1 (pn–pt), program 2 (sb–nd)'; all equal -> 'program 1 codziennie'."""
+        if len(set(vals)) == 1: return f"program {vals[0]} codziennie"
+        by, i = {}, 0
+        while i < 7:
+            j = i
+            while j + 1 < 7 and vals[j + 1] == vals[i]: j += 1
+            by.setdefault(vals[i], []).append(self.DAY_SHORT[i] if i == j else f"{self.DAY_SHORT[i]}–{self.DAY_SHORT[j]}")
+            i = j + 1
+        return ", ".join(f"program {p} ({', '.join(s)})" for p, s in by.items())
+
+    def week_summary(self, backup):
+        """Readable markdown list of a weekly-map backup, for notifications."""
+        lines = []
+        for wk in self.AUTON_WEEKLY:
+            vals = [(backup or {}).get(f"{wk}_{d}") for d in self.DAYS]
+            if any(v is None for v in vals): continue
+            lines.append(f"{self.WK_LABEL.get(wk, wk)}: {self.day_runs([int(v) for v in vals])}")
+        if (backup or {}).get("heater_max_power_index") is not None:
+            kw = {0: 12, 1: 16, 2: 20, 3: 24}.get(int(backup["heater_max_power_index"]))
+            if kw: lines.append(f"Moc maksymalna: {kw} kW")
+        return "\n".join("- " + l for l in lines) or "- (brak zapisanej kopii)"
+
+    def keys_human(self, keys):
+        """['program_co_poniedzialek', ...] -> 'CO (kocioł): pn, wt; Ciepła woda: sb'."""
+        by = {}
+        for k in keys:
+            for wk in sorted(self.AUTON_WEEKLY, key=len, reverse=True):
+                if k.startswith(wk + "_"):
+                    d = k[len(wk) + 1:]
+                    by.setdefault(self.WK_LABEL.get(wk, wk), []).append(
+                        self.DAY_SHORT[self.DAYS.index(d)] if d in self.DAYS else d)
+                    break
+        return "; ".join(f"{lab}: {', '.join(ds)}" for lab, ds in by.items())
+
     def notify_auton(self, msg):
         self.call_service("persistent_notification/create", notification_id="kospel_autonomia",
                           title="Autonomia AI kotła", message=msg)
@@ -465,7 +505,8 @@ class KospelLLM(hass.Hass):
                 except (TypeError, ValueError):
                     v = -1
                 if not 1 <= v <= 8:
-                    self.notify_auton(f"Nie włączam autonomii: nie mogę odczytać {wk} ({d}).")
+                    self.notify_auton(f"Nie włączam autonomii: nie mogę odczytać ustawienia „{self.WK_LABEL.get(wk, wk)}” "
+                                      f"({self.DAY_NAME[self.DAYS.index(d)]}). Sprawdź połączenie z kotłem.")
                     self.call_service("input_select/select_option",
                                       entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
                     return
@@ -499,7 +540,7 @@ class KospelLLM(hass.Hass):
                   "restore_pending": None, "suspended": False})
         self.save_auton(a)
         self.publish_autonomy(a, "tygodnie CO + CWU + cyrkulacja wskazują program 8 (AI)")
-        self.notify_auton("WŁĄCZONA — tygodnie CO, CWU i cyrkulacji przełączone na program 8 (AI). "
+        self.notify_auton("WŁĄCZONA — ogrzewanie, ciepła woda i cyrkulacja działają według planu AI (program 8). "
                           "Wyjście z trybu Autonomiczny przywraca poprzednie ustawienia.")
 
     def verify_engage(self, kwargs):
@@ -517,7 +558,8 @@ class KospelLLM(hass.Hass):
             self.log("AUTONOMY: verify OK — wszystkie dni na programie 8"); return
         att = kwargs.get("attempt", 1)
         if att > 3:
-            self.notify_auton(f"Nie udało się przestawić na program 8 mimo 3 prób: {', '.join(missing)}")
+            self.notify_auton(f"Nie udało się przełączyć na plan AI mimo 3 prób — {self.keys_human(missing)}. "
+                              "Sprawdź połączenie z kotłem.")
             return
         self.log(f"AUTONOMY: verify attempt {att} — dopisuję: {missing}")
         for key in missing:
@@ -554,7 +596,7 @@ class KospelLLM(hass.Hass):
         a["active"] = False; a["suspended"] = False; a["restore_pending"] = None
         self.save_auton(a)
         self.publish_autonomy(a, f"wyłączona: {reason}")
-        self.notify_auton(f"WYŁĄCZONA ({reason}) — przywrócono poprzedni tydzień CO: {a.get('backup')}.")
+        self.notify_auton(f"WYŁĄCZONA ({reason}). Przywrócono Twoje ustawienia:\n\n{self.week_summary(a.get('backup'))}")
 
     def restore_pending_tick(self, a):
         """Finish a restore that was queued while the ESP was unreachable."""
@@ -569,7 +611,7 @@ class KospelLLM(hass.Hass):
             time.sleep(0.4)
         a["restore_pending"] = None; self.save_auton(a)
         self.publish_autonomy(a, "wyłączona — tydzień przywrócony po powrocie ESP")
-        self.notify_auton(f"Przywrócono poprzedni tydzień po powrocie ESP: {rp}.")
+        self.notify_auton(f"ESP znowu dostępny — przywrócono Twoje ustawienia:\n\n{self.week_summary(rp)}")
 
     def autonomy_tick(self, mode):
         """Called every tick: engage/disengage on mode change + safety watchdog."""
@@ -1115,8 +1157,10 @@ class KospelLLM(hass.Hass):
             self.call_service("number/set_value", entity_id=f"number.kc868_heater_program_c_mg3_{d}", value=self.AI_PROG_NR)
             time.sleep(0.4)
         self.run_in(self.verify_engage, 75, attempt=1)
-        self.notify_auton(f"C.MG3 dołączony do autonomii: plan CO w programie {self.AI_PROG_NR} C.MG3, mapa tygodnia → "
-                          f"{self.AI_PROG_NR}. Kopia Twojego tygodnia C.MG3: {cur}.")
+        self.notify_auton("Ogrzewanie (C.MG3) jest teraz sterowane przez AI: plan ogrzewania zapisano w programie "
+                          f"{self.AI_PROG_NR} C.MG3 i tydzień C.MG3 przełączono na ten program.\n\n"
+                          f"Zapamiętany Twój dotychczasowy tydzień C.MG3: {self.day_runs(list(cur.values()))}. "
+                          "Wróci po wyłączeniu trybu Autonomiczny.")
 
     def slots_from_sensor(self, entity):
         """Parse a schedule sensor's 'przedzialy' back into (start_min, stop_min, level) slots."""
