@@ -441,7 +441,8 @@ class KospelLLM(hass.Hass):
                                   entity_id=f"number.kc868_heater_{wk}_{d}", value=self.AI_PROG_NR)
                 time.sleep(0.4)   # a 21-call burst loses tail commands (observed: circ days never armed)
         self.run_in(self.verify_engage, 75, attempt=1)
-        a.update({"active": True, "backup": backup, "since": time.strftime("%Y-%m-%d %H:%M")})
+        a.update({"active": True, "backup": backup, "since": time.strftime("%Y-%m-%d %H:%M"),
+                  "restore_pending": None, "suspended": False})
         self.save_auton(a)
         self.publish_autonomy(a, "tygodnie CO + CWU + cyrkulacja wskazują program 8 (AI)")
         self.notify_auton("WŁĄCZONA — tygodnie CO, CWU i cyrkulacji przełączone na program 8 (AI). "
@@ -484,13 +485,37 @@ class KospelLLM(hass.Hass):
             self._pwr_sig = None
         except Exception as e:
             self.log(f"power plan disable err: {e}", level="WARNING")
+        if self.stt("binary_sensor.kc868_heater_heater_alarm") not in ("on", "off"):
+            # ESP unreachable: writes would be silently lost -> queue the restore for its return
+            a["restore_pending"] = dict(a.get("backup") or {})
+            a["active"] = False; a["suspended"] = False
+            self.save_auton(a)
+            self.publish_autonomy(a, f"wyłączona: {reason} — przywrócenie tygodnia po powrocie ESP")
+            self.notify_auton(f"WYŁĄCZONA ({reason}). ESP niedostępny — poprzedni tydzień przywrócę, gdy wróci.")
+            return
         for key, v in (a.get("backup") or {}).items():
             self.call_service("number/set_value",
                               entity_id=f"number.kc868_heater_{key}", value=v)
-        a["active"] = False
+            time.sleep(0.4)                                   # a 21-call burst loses tail writes
+        a["active"] = False; a["suspended"] = False; a["restore_pending"] = None
         self.save_auton(a)
         self.publish_autonomy(a, f"wyłączona: {reason}")
         self.notify_auton(f"WYŁĄCZONA ({reason}) — przywrócono poprzedni tydzień CO: {a.get('backup')}.")
+
+    def restore_pending_tick(self, a):
+        """Finish a restore that was queued while the ESP was unreachable."""
+        rp = a.get("restore_pending")
+        if not rp or self.stt("binary_sensor.kc868_heater_heater_alarm") not in ("on", "off"): return
+        try:
+            self.call_service("esphome/kc868_heater_set_power_plan", plan=[3] * 24, floor=0.0, cwu_min=0.0, enable=False)
+        except Exception as e:
+            self.log(f"power plan disable err: {e}", level="WARNING")
+        for key, v in rp.items():
+            self.call_service("number/set_value", entity_id=f"number.kc868_heater_{key}", value=v)
+            time.sleep(0.4)
+        a["restore_pending"] = None; self.save_auton(a)
+        self.publish_autonomy(a, "wyłączona — tydzień przywrócony po powrocie ESP")
+        self.notify_auton(f"Przywrócono poprzedni tydzień po powrocie ESP: {rp}.")
 
     def autonomy_tick(self, mode):
         """Called every tick: engage/disengage on mode change + safety watchdog."""
@@ -501,6 +526,8 @@ class KospelLLM(hass.Hass):
         a = self.load_auton()
         if self.get_state("sensor.kospel_ai_autonomia") is None:
             self.publish_autonomy(a)   # ensure the status sensor always exists (startup / HA restart)
+        if not a.get("active") and a.get("restore_pending") and mode != "Autonomiczny":
+            self.restore_pending_tick(a)
         if mode == "Autonomiczny" and not a.get("active"):
             self.engage_autonomy()
         elif mode != "Autonomiczny" and a.get("active"):
@@ -513,16 +540,26 @@ class KospelLLM(hass.Hass):
             # 'unavailable' is NOT an alarm — it's the ESP rebooting (e.g. an OTA flash). Real
             # alarm ("on") disengages immediately; unavailability only after a 5-min grace, when
             # autonomy genuinely can't supervise the heater any more.
+            # ESP unreachable: SUSPEND, do not disengage. Nothing can reach the heater during an outage
+            # and a restore of the weekly maps would be lost (observed twice: autonomy flag off while
+            # the maps stayed on program 8). The heater keeps running the last good program meanwhile.
             if alarm not in ("on", "off"):
                 if not a.get("esp_down_since"):
                     a["esp_down_since"] = time.time(); self.save_auton(a)
-                elif time.time() - a["esp_down_since"] > 300:
-                    self.disengage_autonomy("watchdog: kocioł/ESP niedostępny > 5 min")
-                    self.call_service("input_select/select_option",
-                                      entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
+                elif time.time() - a["esp_down_since"] > 300 and not a.get("suspended"):
+                    a["suspended"] = True; self.save_auton(a)
+                    self.publish_autonomy(a, "zawieszona: kocioł/ESP niedostępny — wznowię automatycznie")
+                    self.notify_auton("ZAWIESZONA — kocioł/ESP niedostępny > 5 min. Kocioł pracuje na ostatnim "
+                                      "programie; wznowię sterowanie, gdy ESP wróci.")
                 return
-            if a.get("esp_down_since"):
-                a["esp_down_since"] = None; self.save_auton(a)
+            if a.get("esp_down_since") or a.get("suspended"):
+                was = a.get("suspended")
+                a["esp_down_since"] = None; a["suspended"] = False; self.save_auton(a)
+                if was:
+                    self._pwr_sig = None                      # force a fresh power-plan push
+                    self.run_in(self.verify_engage, 30, attempt=1)
+                    self.publish_autonomy(a, "wznowiona po powrocie ESP")
+                    self.notify_auton("WZNOWIONA — ESP znowu dostępny; sprawdzam tydzień i plan mocy.")
             # debounce: a real boiler alarm persists; a 1-2 tick 'on' right after an ESP reboot
             # (sensor init glitch) must not kill autonomy
             if alarm == "on":
@@ -754,12 +791,14 @@ class KospelLLM(hass.Hass):
             elif a.get("season_pending"): blocked = "czekam na potwierdzenie poprzedniej zmiany"
             elif target == "summer" and self.stt("switch.kc868_heater_zasobnik_cwu_wlaczony") != "on":
                 blocked = "lato wymaga włączonego zasobnika CWU (bit 4) — nie przełączam"
-            self.set_state("sensor.kospel_ai_sezon", state=cur,
+            written = bool(target and not blocked)
+            self.set_state("sensor.kospel_ai_sezon", state=target if written else cur,
                            attributes={"friendly_name": "AI — sezon", "icon": "mdi:sun-snowflake-variant",
                                        "decyzja": target or "bez zmian", "powod": reason, "blokada": blocked,
-                                       "sterowanie_wlaczone": enabled, "ostatnia_zmiana":
-                                       time.strftime("%Y-%m-%d %H:%M", time.localtime(a["season_changed_at"]))
-                                       if a.get("season_changed_at") else None, **facts})
+                                       "sterowanie_wlaczone": enabled, "oczekuje_potwierdzenia": written,
+                                       "ostatnia_zmiana": time.strftime("%Y-%m-%d %H:%M", time.localtime(
+                                           now if written else a["season_changed_at"]))
+                                       if (written or a.get("season_changed_at")) else None, **facts})
             if target and not blocked:
                 self.call_service("select/select_option", entity_id="select.kc868_heater_heater_mode", option=target)
                 a["season_pending"] = {"target": target, "at": now, "reason": reason}

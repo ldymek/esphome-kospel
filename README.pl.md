@@ -227,6 +227,14 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - **Pilnuj tego, co kocioł faktycznie wykonuje, a nie własnych flag.** Awaria sieci (aktualizacja
   firmware routera) zgasiła flagę autonomii, choć mapy tygodnia dalej wskazywały program AI; strażnik
   oparty na fladze stał bezczynnie. Oparty na mapach tygodnia — działa.
+- **Dziel energię po fladze, której można ufać.** Licznik CO liczył moc tylko przy włączonej fladze
+  zapotrzebowania CO kotła, ale przy zewnętrznym regulatorze pokojowym albo sterowniku obiegu C.MG3 ta flaga
+  nigdy się nie włącza, więc energia ogrzewania wynosiła zero. Flaga zapotrzebowania CWU jest wiarygodna, więc
+  CO to teraz wszystko, co kocioł spala poza ładowaniem zasobnika, a każda kWh trafia do dokładnie jednego koszyka.
+- **Po utracie łączności zawieszaj, nie wyłączaj.** Gdy ESP był offline, watchdog wyłączał autonomię i próbował
+  przywrócić programy tygodniowe tym samym łączem, które nie działało, więc przywrócenie przepadało, a kocioł
+  dalej wykonywał program AI przy wyłączonej autonomii. Awaria łącza teraz zawiesza i wznawia sterowanie, a
+  przywrócenie zlecone w trakcie awarii czeka na powrót ESP.
 - **Audyt LLM to druga opinia, nie ostatnie słowo.** W trybie hybrydowym wskazał realne problemy, ale
   też sam sobie zaprzeczył („za dużo bloków Komfort", po czym dodał kolejny). Deterministyczne reguły
   są ostatnią bramką dla każdego autora.

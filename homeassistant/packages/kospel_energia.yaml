@@ -15,9 +15,12 @@ template:
         state_class: measurement
         availability: >
           {{ states('sensor.kc868_heater_heater_power_now') not in ['unknown','unavailable'] }}
+        # CO = everything the boiler burns that is NOT charging the DHW tank. The boiler's own co_demand
+        # flag cannot be used: with an external room regulator / C.MG3 ("Źródło ciepła") it never asserts,
+        # so CO energy read 0 while real heating kWh went uncounted (found 2026-09-25).
         state: >
           {% set p = states('sensor.kc868_heater_heater_power_now') | float(0) %}
-          {{ p if is_state('binary_sensor.kc868_heater_heater_co_demand', 'on') else 0 }}
+          {{ p if not is_state('binary_sensor.kc868_heater_heater_dhw_demand', 'on') else 0 }}
       - name: "Kospel moc CWU"
         unique_id: kospel_moc_cwu
         unit_of_measurement: "kW"

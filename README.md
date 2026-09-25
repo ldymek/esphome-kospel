@@ -216,6 +216,14 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - **Guard on what the heater actually runs, not on your own flags.** A network outage (router
   firmware upgrade) dropped the autonomy flag while the weekly maps still pointed at the AI programme;
   a guard keyed on the flag stayed inert. Key it on the weekly maps.
+- **Split energy by the flag you can trust.** The CO meter counted power only while the boiler's own
+  CO-demand flag was on, but with an external room regulator or a C.MG3 circuit controller that flag never
+  asserts, so heating energy read zero. The DHW-demand flag is reliable, so CO is now defined as everything
+  the boiler burns that is not charging the tank, and every kilowatt-hour lands in exactly one bucket.
+- **Suspend on a lost link, don't disengage.** When the ESP went offline the watchdog disengaged autonomy and
+  tried to restore the weekly programs, over the same link that was down, so the restore was lost and the
+  heater kept running the AI program with autonomy switched off. An outage now suspends and resumes, and a
+  restore requested while offline is queued until the ESP returns.
 - **The LLM's audit is a second opinion, not the last word.** In hybrid mode it flagged real issues
   but also contradicted itself ("too many comfort blocks", then added one). The deterministic rules
   are the final gate for every author.
