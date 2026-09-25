@@ -94,6 +94,25 @@ zamienia zabłąkany Komfort+ na Komfort, a Komfort− na przerwę ekonomiczną.
 zostają godziny o najsilniejszym zaobserwowanym poborze. Korekty są logowane i publikowane w atrybucie `korekty_regul`
 sensora harmonogramu, a `zrodlo` dostaje dopisek „+ reguły".
 
+## Sterowanie sezonem (v2.3)
+
+Przy włączonym `input_boolean.kospel_ai_sezon_auto` i aktywnej autonomii silnik sam decyduje lato ↔ zima
+(`kospel_engine.season_decision`), z oceną co 15 minut:
+
+- **Na zimę**, gdy prognoza na najbliższe 24 h spada o ponad 0,5 °C poniżej własnego progu wyłączenia CO kotła
+  (`co_outside_off_temp`), albo gdy na zewnątrz jest poniżej progu, a dom jest o ponad 1 °C poniżej celu. Tryb
+  zimowy tylko *dopuszcza* grzanie — próg kotła i tak blokuje CO w ciepłe dni — więc w tę stronę reguła jest szybka.
+- **Na lato** tylko przy pewnym cieple: średnia zewnętrzna z 24 h ponad 3 °C powyżej progu, cała prognoza na 24 h
+  ponad 1,5 °C powyżej niego i dom blisko celu.
+- **Czasy blokady** przeciw przełączaniu w okresie przejściowym: co najmniej 6 h w lecie przed powrotem na zimę,
+  48 h w zimie przed latem. Ręczna zmiana sezonu przez człowieka jest wykrywana i szanowana przez 12 h.
+- Lato nigdy nie jest zapisywane przy wyłączonym zasobniku CWU (kocioł to odrzuca — patrz CONFIG-FLAGS).
+- Każda zmiana jest odczytywana po 75 s i ponawiana raz; odmowa kotła wysyła powiadomienie i wstrzymuje próby
+  na 6 h. Każda zmiana trafia na telefon i do logu; `sensor.kospel_ai_sezon` pokazuje decyzję i jej dane wejściowe.
+- Watchdog temperatury pokojowej wyłącza autonomię już tylko zimą: latem kocioł i tak nie grzeje, więc
+  wyłączanie w chłodną noc niczego nie chroniło, a tylko wyłączało AI.
+- LLM widzi decyzję o sezonie w kontekście i dostaje zakaz zalecania grzania CO latem.
+
 ## Weryfikacja hybrydowa
 
 W trybie *Hybryda* LLM dostaje plan silnika plus ceny, prognozę, klastry poboru i stan modeli, i musi

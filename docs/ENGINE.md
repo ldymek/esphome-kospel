@@ -92,6 +92,26 @@ guard maps a stray Komfort+ to Komfort and drops Komfort− to the economic gap.
 the hours with the strongest observed draws are kept. Corrections are logged and published in the schedule
 sensor attribute `korekty_regul`, and `zrodlo` gets a "+ reguły" suffix so you can see the guard acted.
 
+## Season steering (v2.3)
+
+With `input_boolean.kospel_ai_sezon_auto` on and autonomy engaged, the engine decides summer ↔ winter
+itself (`kospel_engine.season_decision`), evaluated every 15 minutes:
+
+- **To winter** when the next-24-hour forecast drops more than 0.5 °C below the boiler's own CO cut-off
+  (`co_outside_off_temp`), or when it is below the cut-off outside and the house is more than 1 °C under its
+  comfort target. Winter mode only *allows* heating — the boiler's cut-off still blocks CO on warm days — so
+  the rule is deliberately quick in this direction.
+- **To summer** only when it is reliably warm: 24-hour outdoor mean more than 3 °C above the cut-off, the
+  whole next-24-hour forecast more than 1.5 °C above it, and the house near its target.
+- **Dwell times** against shoulder-season flapping: at least 6 h in summer before going back to winter, 48 h
+  in winter before summer. A manual season change by a person is detected and respected for 12 h.
+- Summer is never written while the DHW tank is disabled (the heater rejects it — see CONFIG-FLAGS).
+- Every switch is read back after 75 s and retried once; a refusal is notified and pauses attempts for 6 h.
+  Each switch is pushed to the phone and logged; `sensor.kospel_ai_sezon` shows the decision and its inputs.
+- The room-temperature watchdog now only disengages autonomy in winter: in summer the boiler cannot heat,
+  so disengaging on a cool night protected nothing and simply switched the AI off.
+- The LLM sees the season decision in its context and is told not to recommend CO heating in summer.
+
 ## Hybrid verification
 
 In *Hybryda* the LLM gets the engine plan plus prices, forecast, usage clusters and model state, and

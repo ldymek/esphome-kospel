@@ -64,6 +64,15 @@
          "name": "Kto planuje (LLM / Silnik / Hybryda)"
         },
         {
+         "entity": "input_boolean.kospel_ai_sezon_auto",
+         "name": "AI steruje sezonem (lato/zima)"
+        },
+        {
+         "entity": "sensor.kospel_ai_sezon",
+         "name": "Decyzja AI o sezonie",
+         "secondary_info": "last-updated"
+        },
+        {
          "entity": "input_select.kospel_preferencja",
          "name": "Preferencja: koszt vs komfort"
         },

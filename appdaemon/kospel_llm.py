@@ -534,7 +534,7 @@ class KospelLLM(hass.Hass):
                                       entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
             elif a.get("alarm_since"):
                 a["alarm_since"] = None; self.save_auton(a)
-            elif room is not None and room < floor:
+            elif room is not None and room < floor and self.stt("select.kc868_heater_heater_mode") == "winter":
                 self.disengage_autonomy(f"watchdog: pokój {room:.1f}°C < próg {floor:.1f}°C")
                 self.call_service("input_select/select_option",
                                   entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
@@ -542,6 +542,7 @@ class KospelLLM(hass.Hass):
                 self.power_cap_tick(room, floor)
                 self.battery_tick()
                 self.cwu_floor_tick()
+                self.season_tick()
 
     # ---------- price-driven power plan (opt-in, autonomy only) ----------
     # The heater has no native power schedule, so the AI PUSHES a rolling 24h plan (max-power
@@ -703,6 +704,101 @@ class KospelLLM(hass.Hass):
         except Exception:
             return False
 
+    # ---------- AI season steering (summer <-> winter) ----------
+    SEASON_EVAL_S = 900            # evaluate every 15 min
+    SEASON_USER_HOLD_H = 12        # a manual season change is respected this long
+
+    def forecast_temps(self, hours=24):
+        """Numeric hourly forecast temperatures for the next `hours` (None on failure)."""
+        try:
+            wd = self.get_state("weather")
+            weid = sorted(wd.keys())[0] if wd else None
+            if not weid: return None
+            r = self.sup_json("/services/weather/get_forecasts?return_response", {"entity_id": weid, "type": "hourly"})
+            fc = r.get("service_response", {}).get(weid, {}).get("forecast", [])
+            return [float(f["temperature"]) for f in fc[:hours] if f.get("temperature") is not None] or None
+        except Exception as ex:
+            self.log(f"season forecast err: {type(ex).__name__} {str(ex)[:100]}", level="WARNING")
+            return None
+
+    def season_tick(self):
+        """Engine-decided season switching with hysteresis. Only in autonomy, only with the
+        input_boolean.kospel_ai_sezon_auto toggle on. Every switch is verified and notified; a manual
+        change by a human is detected and respected for SEASON_USER_HOLD_H hours."""
+        try:
+            now = time.time()
+            if now - getattr(self, "_season_ts", 0) < self.SEASON_EVAL_S: return
+            self._season_ts = now
+            a = self.load_auton()
+            cur = self.stt("select.kc868_heater_heater_mode")
+            if cur not in ("summer", "winter"): return
+            # detect a human change: the season moved and it was not our pending write
+            if a.get("season_pending") is None and a.get("season_seen") and cur != a["season_seen"]:
+                a["season_user_hold_until"] = now + self.SEASON_USER_HOLD_H * 3600
+                a["season_changed_at"] = now
+                self.log(f"SEASON: ręczna zmiana na {cur} — AI nie zmienia sezonu przez {self.SEASON_USER_HOLD_H} h")
+            a["season_seen"] = cur
+            enabled = self.stt("input_boolean.kospel_ai_sezon_auto") == "on"
+            hold = a.get("season_user_hold_until") or 0
+            series = self.fetch_series("sensor.kc868_heater_heater_outside_temp", 24) or []
+            mean24 = round(sum(v for _, v in series) / len(series), 1) if series else None
+            room = self.fnum("sensor.dom_temperatura_srednia") or self.fnum("sensor.kc868_heater_heater_room_temp")
+            since = (now - a["season_changed_at"]) / 3600.0 if a.get("season_changed_at") else None
+            target, reason, facts = eng.season_decision(
+                cur, self.fnum("sensor.kc868_heater_heater_outside_temp"), mean24, self.forecast_temps(24),
+                room, self.fnum("number.kc868_heater_heater_room_comfort_temp"),
+                self.fnum("number.kc868_heater_heater_co_outside_off_temp"), since)
+            blocked = None
+            if not enabled: blocked = "sterowanie sezonem wyłączone (input_boolean.kospel_ai_sezon_auto)"
+            elif now < hold: blocked = f"szanuję ręczną zmianę jeszcze {(hold - now)/3600:.1f} h"
+            elif a.get("season_pending"): blocked = "czekam na potwierdzenie poprzedniej zmiany"
+            elif target == "summer" and self.stt("switch.kc868_heater_zasobnik_cwu_wlaczony") != "on":
+                blocked = "lato wymaga włączonego zasobnika CWU (bit 4) — nie przełączam"
+            self.set_state("sensor.kospel_ai_sezon", state=cur,
+                           attributes={"friendly_name": "AI — sezon", "icon": "mdi:sun-snowflake-variant",
+                                       "decyzja": target or "bez zmian", "powod": reason, "blokada": blocked,
+                                       "sterowanie_wlaczone": enabled, "ostatnia_zmiana":
+                                       time.strftime("%Y-%m-%d %H:%M", time.localtime(a["season_changed_at"]))
+                                       if a.get("season_changed_at") else None, **facts})
+            if target and not blocked:
+                self.call_service("select/select_option", entity_id="select.kc868_heater_heater_mode", option=target)
+                a["season_pending"] = {"target": target, "at": now, "reason": reason}
+                a["season_changed_at"] = now
+                self.run_in(self.verify_season, 75, attempt=1)
+                label = {"winter": "ZIMA", "summer": "LATO"}[target]
+                msg = f"AI przełącza kocioł na {label}: {reason}."
+                self.log("SEASON: " + msg)
+                self.call_service("persistent_notification/create", notification_id="kospel_sezon",
+                                  title="Kocioł — zmiana sezonu", message=msg)
+                self.call_service("notify/mobile_app_luke_iphone", title=f"Kocioł → {label}", message=msg,
+                                  data={"tag": "kospel_sezon", "group": "kociol"})
+            self.save_auton(a)
+        except Exception as ex:
+            self.log(f"season_tick error: {type(ex).__name__} {ex}", level="WARNING")
+
+    def verify_season(self, kwargs):
+        a = self.load_auton(); p = a.get("season_pending")
+        if not p: return
+        cur = self.stt("select.kc868_heater_heater_mode")
+        if cur == p["target"]:
+            a["season_pending"] = None; a["season_seen"] = cur; self.save_auton(a)
+            self.log(f"SEASON: potwierdzone {cur} (słowo trybu {self.stt('sensor.kc868_heater_heater_mode_word')})")
+            return
+        if kwargs.get("attempt", 1) < 2:
+            self.log(f"SEASON: {p['target']} jeszcze niepotwierdzone (jest {cur}) — ponawiam zapis", level="WARNING")
+            self.call_service("select/select_option", entity_id="select.kc868_heater_heater_mode", option=p["target"])
+            self.run_in(self.verify_season, 75, attempt=2)
+            return
+        a["season_pending"] = None; a["season_seen"] = cur
+        a["season_user_hold_until"] = time.time() + 6 * 3600       # do not hammer a refusing heater
+        self.save_auton(a)
+        msg = f"Kocioł odrzucił zmianę sezonu na {p['target']} (nadal {cur}). AI wstrzymuje próby na 6 h."
+        self.log("SEASON: " + msg, level="WARNING")
+        self.call_service("persistent_notification/create", notification_id="kospel_sezon",
+                          title="Kocioł — zmiana sezonu nieudana", message=msg)
+        self.call_service("notify/mobile_app_luke_iphone", title="Kocioł — zmiana sezonu nieudana", message=msg,
+                          data={"tag": "kospel_sezon", "group": "kociol"})
+
     def cwu_floor_tick(self):
         """Self-healing guard on the ACTIVE CWU program: re-applies eng.enforce_rules (tank floor,
         no 'no-heating' level outside the night, Komfort budget, pre-peak charge) to what is written on
@@ -769,6 +865,11 @@ class KospelLLM(hass.Hass):
             if cold: parts.append("uzytkownik zglaszal 'za cieplo' okolo godzin: " + ",".join(cold))
         if self.presence_away(): parts.append("NIKOGO W DOMU (wszyscy poza domem >30 min) -> tryb eko")
         parts.append(f"preferencja uzytkownika: {pr['pref']}")
+        s = self.get_state("sensor.kospel_ai_sezon", attribute="all") or {}
+        sa = s.get("attributes") or {}
+        if s:
+            parts.append(f"sezon kotla: {s.get('state')} (AI steruje sezonem: {'tak' if sa.get('sterowanie_wlaczone') else 'nie'}; "
+                         f"ostatnia ocena: {sa.get('powod')}). W trybie lato CO nie grzeje — nie zalecaj grzania CO latem")
         return "\nKontekst domownikow: " + "; ".join(parts) + "\n"
 
     def parse_slots(self, slots):

@@ -37,6 +37,9 @@ input_boolean:
   kospel_ai_moc_auto:
     name: "AI — limit mocy wg cen"
     icon: mdi:speedometer-slow
+  kospel_ai_sezon_auto:
+    name: "AI — sterowanie sezonem"
+    icon: mdi:sun-snowflake-variant
   kospel_zawor_mieszajacy:
     name: "CWU — zawór mieszający (magazyn ciepła)"
     icon: mdi:water-thermometer

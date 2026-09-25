@@ -606,3 +606,46 @@ def backtest(plan_out, kwh_cwu, kwh_co, prices):
     c_sim = sum(k * p for k, p in zip(sim, prices) if p is not None)
     return {"koszt_rzeczywisty": round(c_act, 2), "koszt_wg_planu_silnika": round(c_sim, 2),
             "roznica": round(c_act - c_sim, 2), "uwaga": "szacunek: to samo zużycie kWh przesunięte w okna planu"}
+
+# ----------------------------------------------------------------- season steering
+# The boiler's own outdoor cut-off (co_outside_off_temp, 12.3 C here) still blocks CO above it even in
+# winter mode, so erring towards winter is cheap: winter only *allows* heating. The decision is
+# therefore quick towards winter and slow towards summer, with dwell times against shoulder-season flapping.
+SEASON_WINTER_FC_MARGIN = 0.5    # forecast min must fall this far below the cut-off
+SEASON_SUMMER_MEAN_MARGIN = 3.0  # 24 h outdoor mean this far above the cut-off
+SEASON_SUMMER_FC_MARGIN = 1.5    # and the whole next-24 h forecast above cut-off + this
+SEASON_DWELL_TO_WINTER_H = 6     # after a switch to summer
+SEASON_DWELL_TO_SUMMER_H = 48    # after a switch to winter
+
+def season_decision(season, tout_now, tout_mean_24h, fc_temps, room_mean, room_target, cutoff,
+                    hours_since_change=None):
+    """season: 'summer' | 'winter'. fc_temps: forecast temperatures for the next ~24 h.
+    Returns (target_season or None, reason, facts)."""
+    fc = [x for x in (fc_temps or []) if x is not None]
+    fc_min = min(fc) if fc else None
+    facts = {"sezon": season, "zewn": tout_now, "zewn_srednia_24h": tout_mean_24h,
+             "prognoza_min_24h": fc_min, "dom": room_mean, "cel_dom": room_target, "prog_wylaczenia_co": cutoff,
+             "godz_od_zmiany": round(hours_since_change, 1) if hours_since_change is not None else None}
+    if cutoff is None or season not in ("summer", "winter"):
+        return None, "brak danych (próg wyłączenia CO / sezon)", facts
+    if season == "summer":
+        if hours_since_change is not None and hours_since_change < SEASON_DWELL_TO_WINTER_H:
+            return None, f"lato — blokada zmiany jeszcze {SEASON_DWELL_TO_WINTER_H - hours_since_change:.1f} h", facts
+        if fc_min is not None and fc_min < cutoff - SEASON_WINTER_FC_MARGIN:
+            return "winter", (f"prognoza spada do {fc_min:.1f} °C, poniżej progu wyłączenia CO {cutoff:.1f} °C "
+                              f"— kocioł może być potrzebny w nocy"), facts
+        if (tout_now is not None and tout_now < cutoff and room_mean is not None and room_target is not None
+                and room_mean < room_target - 1.0):
+            return "winter", f"na zewnątrz {tout_now:.1f} °C i dom {room_mean:.1f} °C < cel {room_target:.1f} − 1 °C", facts
+        return None, "lato — ogrzewanie niepotrzebne", facts
+    # winter -> summer: only when reliably warm
+    if hours_since_change is not None and hours_since_change < SEASON_DWELL_TO_SUMMER_H:
+        return None, f"zima — blokada zmiany jeszcze {SEASON_DWELL_TO_SUMMER_H - hours_since_change:.1f} h", facts
+    warm_mean = tout_mean_24h is not None and tout_mean_24h > cutoff + SEASON_SUMMER_MEAN_MARGIN
+    warm_fc = fc_min is not None and fc_min > cutoff + SEASON_SUMMER_FC_MARGIN
+    house_ok = room_mean is None or room_target is None or room_mean >= room_target - 0.5
+    if warm_mean and warm_fc and house_ok:
+        return "summer", (f"średnia 24 h {tout_mean_24h:.1f} °C i prognoza min {fc_min:.1f} °C wyraźnie powyżej "
+                          f"progu {cutoff:.1f} °C — ogrzewanie zbędne"), facts
+    return None, "zima — ogrzewanie może być potrzebne", facts
+
