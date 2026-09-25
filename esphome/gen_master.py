@@ -101,6 +101,27 @@ api:
             for(int i=0;i<5;i++){ uint16_t v=(uint16_t)idxs[i]; regs.push_back(((v&0xFF)<<8)|(v>>8)); }
             id(cmg3)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
                 id(cmg3),(uint16_t)base,15,regs));
+    # The C.MG3 silently ignores a 15-register block write (func 0x10, qty 15 — observed 2026-09-25, read-back
+    # unchanged, no exception) but accepts qty-1 writes (proven: hand temperature, manual mode). Same block
+    # layout and wire encoding as above, written register by register.
+    - action: set_daily_program_cmg3_single
+      variables:
+        base: int
+        starts: int[]
+        stops: int[]
+        idxs: int[]
+      then:
+        - lambda: |-
+            if(!id(esp_owns_bus)) return;
+            if(starts.size()!=5||stops.size()!=5||idxs.size()!=5) return;
+            std::vector<uint16_t> vals;
+            for(int i=0;i<5;i++){ vals.push_back((uint16_t)starts[i]); vals.push_back((uint16_t)stops[i]); }
+            for(int i=0;i<5;i++) vals.push_back((uint16_t)idxs[i]);
+            for(size_t i=0;i<vals.size();i++){
+              uint16_t v=vals[i], w=((v&0xFF)<<8)|(v>>8);
+              id(cmg3)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+                  id(cmg3),(uint16_t)(base+i),1,{w}));
+            }
 ota:
   - platform: esphome
     encryption: {}   # authenticated/encrypted with the API key (plaintext OTA removed in 2027.3)
@@ -1165,7 +1186,7 @@ out.append(f'''  - platform: template
           std::vector<uint16_t> regs;
           for(int s=0;s<5;s++){{ regs.push_back(sw(st[s])); regs.push_back(sw(sp[s])); }}
           for(int s=0;s<5;s++) regs.push_back(sw(lv[s]));
-          if(tt==3) id(cmg3)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(id(cmg3),base,15,regs));
+          if(tt==3){{ for(int r=0;r<15;r++) id(cmg3)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(id(cmg3),(uint16_t)(base+r),1,{{regs[r]}})); }}
           else id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(id(heater),base,15,regs));''')
 
 # TRV-bridge poll + HA-independent window failsafe. Data path: zwave-js (RPi) -> trv_bridge

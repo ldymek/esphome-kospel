@@ -113,6 +113,18 @@ Przy włączonym `input_boolean.kospel_ai_sezon_auto` i aktywnej autonomii silni
   wyłączanie w chłodną noc niczego nie chroniło, a tylko wyłączało AI.
 - LLM widzi decyzję o sezonie w kontekście i dostaje zakaz zalecania grzania CO latem.
 
+## Sterowanie sterownikiem obiegu C.MG3 (v2.4)
+
+Gdy kocioł pracuje jako źródło ciepła („Źródło ciepła”), a na magistrali jest C.MG3, obieg grzewczy wykonuje
+**własną mapę tygodnia i programy dobowe C.MG3**, a nie program CO kotła. Dlatego AI kopiuje każdy plan CO także
+do programu 8 w C.MG3, a autonomia przestawia mapę tygodnia C.MG3 na program 8 razem z mapami kotła. Twoja
+dotychczasowa mapa C.MG3 trafia do kopii autonomii i wraca po wyjściu z trybu *Autonomiczny*. Włączenie autonomii
+zawsze zapisuje plan do programu 8 C.MG3 *przed* zmianą jego mapy, więc obieg nigdy nie wykona nieaktualnego programu.
+
+C.MG3 po cichu ignoruje zapis bloku 15 rejestrów do pamięci programów (bez wyjątku, odczyt bez zmian), ale
+przyjmuje zapisy pojedynczych rejestrów, więc akcja firmware `set_daily_program_cmg3_single` zapisuje ten sam blok
+rejestr po rejestrze. Przycisk *Zapisz* edytora harmonogramów dla C.MG3 korzysta z tej samej ścieżki.
+
 ## Weryfikacja hybrydowa
 
 W trybie *Hybryda* LLM dostaje plan silnika plus ceny, prognozę, klastry poboru i stan modeli, i musi

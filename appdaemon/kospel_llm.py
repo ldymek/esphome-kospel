@@ -46,6 +46,7 @@ class KospelLLM(hass.Hass):
         self.run_daily(self.savings_job, "00:15:00")      # yesterday's counterfactual savings
         self.run_daily(self.diag_job, "04:00:00")         # degradation / drift monitors
         self.run_in(self.restore_diag, 20)
+        self.run_in(self.migrate_cmg3, 60)
         self.run_daily(self.weekly_digest, "08:00:00")    # Monday report
         for sc, d in (("script.kospel_za_zimno", 1), ("script.kospel_za_cieplo", -1)):
             self.listen_state(self.override_event, sc, attribute="last_triggered", direction=d)
@@ -382,8 +383,11 @@ class KospelLLM(hass.Hass):
     # The AI NEVER enables autonomy itself — only the user flips the tryb select; the app
     # can only DOWNGRADE back to shadow. Anti-freeze/disinfection/season are never touched.
     DAYS = ["poniedzialek", "wtorek", "sroda", "czwartek", "piatek", "sobota", "niedziela"]
-    AUTON_WEEKLY = ["program_co", "program_cwu", "program_cyrkulacji"]   # timetables autonomy manages (-> program 8)
-    MAX_CONTENT_WRITES_PER_DAY = 16   # 4 scheduled runs x 3 programmes + headroom for restarts
+    # timetables autonomy manages (-> program 8). program_c_mg3: with the boiler as "Źródło ciepła" the heating
+    # circuit follows the C.MG3's own weekly map, so the CO plan is mirrored there (found 2026-09-25).
+    AUTON_WEEKLY = ["program_co", "program_cwu", "program_cyrkulacji", "program_c_mg3"]
+    MAX_CONTENT_WRITES_PER_DAY = 20   # 4 scheduled runs x 4 programmes (CO, CWU, circ, C.MG3 mirror) + headroom
+    CMG3_PROG_BASE = 0x0B90           # C.MG3 daily programs, program N = base + 15*(N-1)
 
     def auton_file(self): return os.path.join(APPDIR, "autonomy.json")
 
@@ -479,6 +483,12 @@ class KospelLLM(hass.Hass):
         if all(v == self.AI_PROG_NR for k, v in backup.items() if k != "heater_max_power_index") and \
            old and not all(v == self.AI_PROG_NR for k, v in old.items() if k != "heater_max_power_index"):
             backup = dict(old); self.log("AUTONOMY: mapy już wskazują program 8 — zachowuję wcześniejszą kopię tygodnia")
+        co = self.slots_from_sensor("sensor.kospel_ai_harmonogram")
+        if co:
+            self.mirror_cmg3(co)   # queued ahead of the map writes (Modbus queue is FIFO)
+        else:
+            self.log("AUTONOMY: brak planu CO do lustra C.MG3 — mapa C.MG3 wskaże program 8 z dotychczasową treścią",
+                     level="WARNING")
         for wk in self.AUTON_WEEKLY:
             for d in self.DAYS:
                 self.call_service("number/set_value",
@@ -1068,6 +1078,58 @@ class KospelLLM(hass.Hass):
         self.log(f"hybrid verify: {verify}")
         return verify, adj
 
+    def mirror_cmg3(self, clean):
+        """Write the CO plan into the C.MG3's program 8 (same 15-register format and levels). The C.MG3
+        is what actually calls the heating circuit; the boiler's CO program only covers it."""
+        base = self.CMG3_PROG_BASE + 15 * (self.AI_PROG_NR - 1)
+        # single-register writes: the C.MG3 ignores a 15-register block write (see the firmware action)
+        self.call_service("esphome/kc868_heater_set_daily_program_cmg3_single", base=base,
+                          starts=[c[0] for c in clean] + [65535] * (5 - len(clean)),
+                          stops=[c[1] for c in clean] + [65535] * (5 - len(clean)),
+                          idxs=[c[2] for c in clean] + [65535] * (5 - len(clean)))
+        self.count_write(); time.sleep(0.4)
+        self.log(f"schedule -> C.MG3 program {self.AI_PROG_NR} (lustro planu CO)")
+
+    def migrate_cmg3(self, kwargs=None):
+        """One-time upgrade for an install whose autonomy was engaged before the C.MG3 joined AUTON_WEEKLY:
+        record the user's C.MG3 weekly map in the backup, mirror the current CO plan into C.MG3 program 8,
+        and only then point the C.MG3 map at 8 (FIFO Modbus queue: the program lands first)."""
+        a = self.load_auton()
+        if not a.get("active"): return
+        bk = a.get("backup") or {}
+        if any(k.startswith("program_c_mg3_") for k in bk): return            # already migrated
+        cur = {}
+        for d in self.DAYS:
+            try: cur[f"program_c_mg3_{d}"] = int(float(self.stt(f"number.kc868_heater_program_c_mg3_{d}")))
+            except (TypeError, ValueError):
+                self.run_in(self.migrate_cmg3, 120); return                    # ESP not ready yet, retry
+        if all(v == self.AI_PROG_NR for v in cur.values()):
+            cur = {k: 1 for k in cur}                                         # unknown original: assume program 1
+            self.log("AUTONOMY: mapa C.MG3 już na 8 bez kopii — zakładam program 1 jako kopię", level="WARNING")
+        co = self.slots_from_sensor("sensor.kospel_ai_harmonogram")
+        if not co:
+            self.log("AUTONOMY: migracja C.MG3 wstrzymana — brak planu CO do lustra", level="WARNING"); return
+        self.mirror_cmg3(co)
+        bk.update(cur); a["backup"] = bk; self.save_auton(a)
+        for d in self.DAYS:
+            self.call_service("number/set_value", entity_id=f"number.kc868_heater_program_c_mg3_{d}", value=self.AI_PROG_NR)
+            time.sleep(0.4)
+        self.run_in(self.verify_engage, 75, attempt=1)
+        self.notify_auton(f"C.MG3 dołączony do autonomii: plan CO w programie {self.AI_PROG_NR} C.MG3, mapa tygodnia → "
+                          f"{self.AI_PROG_NR}. Kopia Twojego tygodnia C.MG3: {cur}.")
+
+    def slots_from_sensor(self, entity):
+        """Parse a schedule sensor's 'przedzialy' back into (start_min, stop_min, level) slots."""
+        st = self.get_state(entity, attribute="all") or {}
+        lv = {"Ochrona": 1, "Komfort": 2, "Komfort-": 3, "Komfort+": 4}
+        out = []
+        for p in (st.get("attributes") or {}).get("przedzialy") or []:
+            try:
+                out.append((int(p[0:2]) * 60 + int(p[3:5]), int(p[6:8]) * 60 + int(p[9:11]), lv[p.split(" ", 1)[1]]))
+            except Exception:
+                return []
+        return self.parse_slots([{"start_min": a, "stop_min": b, "level": l} for a, b, l in out])
+
     def write_plans(self, plans, source, live, fixes=None):
         lvl = {1: "Ochrona", 2: "Komfort", 3: "Komfort-", 4: "Komfort+"}
         out = {}
@@ -1081,6 +1143,8 @@ class KospelLLM(hass.Hass):
             self.call_service("esphome/kc868_heater_set_daily_program_heater",
                               base=base, starts=starts, stops=stops, idxs=idxs)
             self.count_write(); time.sleep(0.4)
+            if tt["key"] == "CO":
+                self.mirror_cmg3(clean)
             human = [f"{a//60:02d}:{a%60:02d}-{b//60:02d}:{b%60:02d} {lvl[v]}" for a, b, v in clean]
             status_txt = ("AKTYWNY (autonomia)" if self.load_auton().get("active") else
                           "AKTYWNY (tydzień wskazuje program 8)") if live else "NIEAKTYWNY"
@@ -1089,6 +1153,7 @@ class KospelLLM(hass.Hass):
                                        "icon": "mdi:calendar-star", "przedzialy": human,
                                        "zrodlo": source.get(tt["key"], "?"),
                                        "korekty_regul": (fixes or {}).get(tt["key"], []),
+                                       **({"lustro_c_mg3": f"C.MG3 program {self.AI_PROG_NR}"} if tt["key"] == "CO" else {}),
                                        "zapisano_do": f"{tt['key']} program {self.AI_PROG_NR} ({status_txt})",
                                        "aktywacja": ("steruje kotłem (Autonomiczny)" if live else
                                                      f"ustaw dzień na 8 w Programy {tt['key']} lub tryb Autonomiczny")})

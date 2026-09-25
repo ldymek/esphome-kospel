@@ -227,6 +227,10 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - **Pilnuj tego, co kocioł faktycznie wykonuje, a nie własnych flag.** Awaria sieci (aktualizacja
   firmware routera) zgasiła flagę autonomii, choć mapy tygodnia dalej wskazywały program AI; strażnik
   oparty na fladze stał bezczynnie. Oparty na mapach tygodnia — działa.
+- **Sprawdź, które urządzenie naprawdę wykonuje harmonogram.** Przy kotle ustawionym jako źródło ciepła obieg
+  grzewczy wykonywał własne programy C.MG3, więc przez tygodnie plan CO od AI niczego nie zmieniał. A C.MG3 po
+  cichu ignoruje harmonogram zapisany jednym blokiem 15 rejestrów, bez błędu, przyjmując te same dane rejestr po
+  rejestrze. Zanim zaufasz zapisowi, odczytaj go z urządzenia.
 - **Dziel energię po fladze, której można ufać.** Licznik CO liczył moc tylko przy włączonej fladze
   zapotrzebowania CO kotła, ale przy zewnętrznym regulatorze pokojowym albo sterowniku obiegu C.MG3 ta flaga
   nigdy się nie włącza, więc energia ogrzewania wynosiła zero. Flaga zapotrzebowania CWU jest wiarygodna, więc

@@ -216,6 +216,10 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - **Guard on what the heater actually runs, not on your own flags.** A network outage (router
   firmware upgrade) dropped the autonomy flag while the weekly maps still pointed at the AI programme;
   a guard keyed on the flag stayed inert. Key it on the weekly maps.
+- **Find out which device really runs the schedule.** With the boiler set up as a heat source, the heating
+  circuit followed the C.MG3's own programs, so for weeks the AI's CO plan changed nothing. And the C.MG3
+  silently ignores a timetable written as one 15-register block, with no error, while accepting the same
+  data one register at a time. Read it back from the device before you trust a write.
 - **Split energy by the flag you can trust.** The CO meter counted power only while the boiler's own
   CO-demand flag was on, but with an external room regulator or a C.MG3 circuit controller that flag never
   asserts, so heating energy read zero. The DHW-demand flag is reliable, so CO is now defined as everything

@@ -112,6 +112,19 @@ itself (`kospel_engine.season_decision`), evaluated every 15 minutes:
   so disengaging on a cool night protected nothing and simply switched the AI off.
 - The LLM sees the season decision in its context and is told not to recommend CO heating in summer.
 
+## Steering the C.MG3 circuit controller (v2.4)
+
+With the boiler configured as a heat source ("Źródło ciepła") and a C.MG3 on the bus, the heating circuit
+follows the **C.MG3's own weekly map and daily programs**, not the boiler's CO program. The AI therefore
+mirrors every CO plan into the C.MG3's program 8 as well, and autonomy points the C.MG3's weekly map at
+program 8 alongside the boiler's maps. Your original C.MG3 map goes into the autonomy backup and is restored
+when you leave *Autonomiczny*. Engaging always writes the plan into C.MG3 program 8 *before* moving its map,
+so the circuit never follows a stale program.
+
+The C.MG3 silently ignores a 15-register block write to its program memory (no exception, read-back
+unchanged) but accepts one-register writes, so the firmware action `set_daily_program_cmg3_single` writes
+the same block register by register. The schedule editor's C.MG3 *Save* uses the same path.
+
 ## Hybrid verification
 
 In *Hybryda* the LLM gets the engine plan plus prices, forecast, usage clusters and model state, and
