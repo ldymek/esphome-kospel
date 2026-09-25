@@ -14,6 +14,7 @@ import kospel_engine as eng
 
 APPDIR = os.path.dirname(os.path.abspath(__file__))
 PSTRYK_KEY_FILE = os.path.join(APPDIR, ".pstryk-key")
+LLM_KEY_FILE = os.path.join(APPDIR, ".llm-key")   # per-app API key for the LLM load balancer (chmod 600)
 CACHE = os.path.join(APPDIR, "last_analysis.json")
 PSTRYK_URL = ("https://api.pstryk.pl/integrations/meter-data/unified-metrics/"
               "?metrics=pricing&resolution=hour&window_start={s}&window_end={e}")
@@ -73,7 +74,9 @@ class KospelLLM(hass.Hass):
                 "options": {"temperature": temp, "num_predict": npredict, "repeat_penalty": 1.15}}
         if schema: body["format"] = schema
         t = time.time()
-        r = self.http_json(host.rstrip("/") + "/api/chat", body, timeout=240)
+        key = self.llm_key()
+        hdrs = {"Authorization": "Bearer " + key} if key else None
+        r = self.http_json(host.rstrip("/") + "/api/chat", body, headers=hdrs, timeout=240)
         return r["message"]["content"], time.time() - t, r.get("eval_count", 0)
 
     # ---------- supervisor REST (forecast + history; no long-lived token needed) ----------
@@ -135,6 +138,19 @@ class KospelLLM(hass.Hass):
         return trend or None
 
     # ---------- prices ----------
+    def llm_key(self):
+        """LLM load-balancer API key: apps.yaml arg `llm_api_key` (supports !secret) > .llm-key file.
+        Deliberately NOT an HA helper — a key in HA state would be readable by every dashboard user."""
+        k = self.args.get("llm_api_key")
+        if k and str(k).strip():
+            return str(k).strip()
+        try:
+            if os.path.exists(LLM_KEY_FILE):
+                return open(LLM_KEY_FILE).read().strip() or None
+        except Exception:
+            pass
+        return None
+
     def pstryk_key(self):
         """Key resolution order: input_text helper (runtime override) > apps.yaml arg
         `pstryk_api_key` (canonical AppDaemon config, supports !secret) > .pstryk-key file."""

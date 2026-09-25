@@ -8,6 +8,9 @@
 kospel_llm:
   module: kospel_llm
   class: KospelLLM
+  # optional: per-app API key if your LLM endpoint / load balancer requires one
+  # (sent as 'Authorization: Bearer <key>'). Alternatively put it in apps/.llm-key (chmod 600).
+  # llm_api_key: !secret llm_api_key
   ollama_host: http://192.168.1.21:11434     # EDIT ME
   pstryk_api_key: !secret pstryk_api_key     # or leave out and use the UI field / key file
   # presence -> eco planning when everyone is away >30 min (default: all person.* you list here)
