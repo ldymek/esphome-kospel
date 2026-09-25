@@ -9,12 +9,13 @@ Port of bin/kospel_llm.py (previously a systemd daemon on the GPU box). Same beh
 Deploy: /addon_configs/a0d7b954_appdaemon/apps/{kospel_llm.py,apps.yaml,.pstryk-key}
 """
 import appdaemon.plugins.hass.hassapi as hass
-import json, urllib.request, urllib.error, datetime, time, os
+import json, urllib.request, urllib.error, datetime, time, os, ssl
 import kospel_engine as eng
 
 APPDIR = os.path.dirname(os.path.abspath(__file__))
 PSTRYK_KEY_FILE = os.path.join(APPDIR, ".pstryk-key")
 LLM_KEY_FILE = os.path.join(APPDIR, ".llm-key")   # per-app API key for the LLM load balancer (chmod 600)
+LLM_CA_FILE = os.path.join(APPDIR, "llm-ca.crt")   # private CA of the LLM endpoint (public cert, not a secret)
 CACHE = os.path.join(APPDIR, "last_analysis.json")
 PSTRYK_URL = ("https://api.pstryk.pl/integrations/meter-data/unified-metrics/"
               "?metrics=pricing&resolution=hour&window_start={s}&window_end={e}")
@@ -58,7 +59,7 @@ class KospelLLM(hass.Hass):
         v = self.get_state(eid)
         return default if v is None else str(v)
 
-    def http_json(self, url, body=None, headers=None, timeout=30, resp_headers=None):
+    def http_json(self, url, body=None, headers=None, timeout=30, resp_headers=None, context=None):
         h = dict(headers or {})
         data = None
         if body is not None:
@@ -66,7 +67,7 @@ class KospelLLM(hass.Hass):
             h["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=h,
                                      method="POST" if body is not None else "GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
             if resp_headers is not None:
                 resp_headers.update({k.lower(): v for k, v in resp.headers.items()})
             return json.load(resp)
@@ -82,7 +83,8 @@ class KospelLLM(hass.Hass):
         hdrs = {"Authorization": "Bearer " + key} if key else None
         rh = {}
         try:
-            r = self.http_json(host.rstrip("/") + "/api/chat", body, headers=hdrs, timeout=240, resp_headers=rh)
+            ctx = self.llm_ssl_context() if host.lower().startswith("https://") else None
+            r = self.http_json(host.rstrip("/") + "/api/chat", body, headers=hdrs, timeout=240, resp_headers=rh, context=ctx)
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 raise RuntimeError("LLM odrzucił klucz API (HTTP 401) — sprawdź apps/.llm-key") from None
@@ -149,6 +151,15 @@ class KospelLLM(hass.Hass):
         return trend or None
 
     # ---------- prices ----------
+    def llm_ssl_context(self):
+        """TLS context for the LLM endpoint only: verifies against the private CA (apps.yaml `llm_ca_file`,
+        else apps/llm-ca.crt), falling back to the system trust store. Verification is never disabled.
+        Scoped to LLM calls so a private CA cannot vouch for Pstryk or any other host."""
+        if getattr(self, "_llm_ctx", None) is None:
+            ca = self.args.get("llm_ca_file") or (LLM_CA_FILE if os.path.exists(LLM_CA_FILE) else None)
+            self._llm_ctx = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+        return self._llm_ctx
+
     def check_llm_auth(self, who, key):
         """Early warning before the LB's grace period ends: with a key configured the LB must name our
         app in x-llm-auth; 'anonymous' means the key is missing/unrecognised and will turn into HTTP 401.
@@ -1444,14 +1455,14 @@ class KospelLLM(hass.Hass):
             self.log(f"backtest error: {type(ex).__name__} {ex}", level="WARNING")
             self.set_state("sensor.kospel_backtest", state="błąd", attributes={"friendly_name": "Backtest silnika (wczoraj)", "blad": str(ex)[:200]})
 
-    LLM_LB = "http://192.168.1.27:11434"
+    LLM_LB = "https://192.168.1.27:11443"     # TLS since 2026-09-25; plain :11434 is being closed
     def llm_host(self):
         """Ollama base URL: helper > apps.yaml > LB default. Direct GPU hosts (.20/.21) are rewritten
         to the load balancer — calling them bypasses failover and lands the 26B on the one machine
         that spills it to CPU (observed 2026-09-06 after an HA restart re-applied a stale helper)."""
         h = self.stt("input_text.kospel_llm_host", self.args.get("ollama_host", self.LLM_LB)) or self.LLM_LB
-        if any(x in h for x in ("192.168.1.21", "192.168.1.20")):
-            self.log(f"LLM host {h} is a GPU node, not the LB -> using {self.LLM_LB}", level="WARNING")
+        if any(x in h for x in ("192.168.1.21", "192.168.1.20")) or h.rstrip("/") == "http://192.168.1.27:11434":
+            self.log(f"LLM host {h} is a GPU node or the retired plain-HTTP port -> using {self.LLM_LB}", level="WARNING")
             try: self.call_service("input_text/set_value", entity_id="input_text.kospel_llm_host", value=self.LLM_LB)
             except Exception: pass
             h = self.LLM_LB
