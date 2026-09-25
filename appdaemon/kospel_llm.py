@@ -9,7 +9,7 @@ Port of bin/kospel_llm.py (previously a systemd daemon on the GPU box). Same beh
 Deploy: /addon_configs/a0d7b954_appdaemon/apps/{kospel_llm.py,apps.yaml,.pstryk-key}
 """
 import appdaemon.plugins.hass.hassapi as hass
-import json, urllib.request, datetime, time, os
+import json, urllib.request, urllib.error, datetime, time, os
 import kospel_engine as eng
 
 APPDIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,7 +57,7 @@ class KospelLLM(hass.Hass):
         v = self.get_state(eid)
         return default if v is None else str(v)
 
-    def http_json(self, url, body=None, headers=None, timeout=30):
+    def http_json(self, url, body=None, headers=None, timeout=30, resp_headers=None):
         h = dict(headers or {})
         data = None
         if body is not None:
@@ -65,7 +65,10 @@ class KospelLLM(hass.Hass):
             h["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=h,
                                      method="POST" if body is not None else "GET")
-        return json.load(urllib.request.urlopen(req, timeout=timeout))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp_headers is not None:
+                resp_headers.update({k.lower(): v for k, v in resp.headers.items()})
+            return json.load(resp)
 
     def ollama_chat(self, host, model, system, user, schema=None, thinking=False, temp=0.2, npredict=700):
         body = {"model": model, "stream": False, "think": bool(thinking),
@@ -76,7 +79,14 @@ class KospelLLM(hass.Hass):
         t = time.time()
         key = self.llm_key()
         hdrs = {"Authorization": "Bearer " + key} if key else None
-        r = self.http_json(host.rstrip("/") + "/api/chat", body, headers=hdrs, timeout=240)
+        rh = {}
+        try:
+            r = self.http_json(host.rstrip("/") + "/api/chat", body, headers=hdrs, timeout=240, resp_headers=rh)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise RuntimeError("LLM odrzucił klucz API (HTTP 401) — sprawdź apps/.llm-key") from None
+            raise
+        self.check_llm_auth(rh.get("x-llm-auth"), key)
         return r["message"]["content"], time.time() - t, r.get("eval_count", 0)
 
     # ---------- supervisor REST (forecast + history; no long-lived token needed) ----------
@@ -138,6 +148,24 @@ class KospelLLM(hass.Hass):
         return trend or None
 
     # ---------- prices ----------
+    def check_llm_auth(self, who, key):
+        """Early warning before the LB's grace period ends: with a key configured the LB must name our
+        app in x-llm-auth; 'anonymous' means the key is missing/unrecognised and will turn into HTTP 401.
+        No header at all = an endpoint without auth, nothing to check. Notifies at most once a day."""
+        if not who or not key: return
+        self._llm_auth = who
+        if who.strip().lower() != "anonymous": return
+        today = time.strftime("%Y-%m-%d")
+        if getattr(self, "_llm_auth_warned", "") == today: return
+        self._llm_auth_warned = today
+        msg = ("Load balancer LLM nie rozpoznaje klucza API tej aplikacji (x-llm-auth: anonymous). Po okresie "
+               "przejściowym zapytania dostaną HTTP 401 — sprawdź apps/.llm-key.")
+        self.log("LLM AUTH: " + msg, level="WARNING")
+        self.call_service("persistent_notification/create", notification_id="kospel_llm_auth",
+                          title="AI kotła — klucz LLM", message=msg)
+        self.call_service("notify/mobile_app_luke_iphone", title="AI kotła — klucz LLM", message=msg,
+                          data={"tag": "kospel_llm_auth", "group": "kociol"})
+
     def llm_key(self):
         """LLM load-balancer API key: apps.yaml arg `llm_api_key` (supports !secret) > .llm-key file.
         Deliberately NOT an HA helper — a key in HA state would be readable by every dashboard user."""
