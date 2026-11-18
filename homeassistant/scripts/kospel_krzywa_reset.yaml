@@ -1,0 +1,34 @@
+# Dashboard button: set the boiler heating-curve offset back to 0, confirmed by read-back.
+alias: 'Kospel: reset krzywej'
+icon: mdi:restore
+mode: restart
+sequence:
+- variables:
+    target: '{{ (0)|round(1) }}'
+- repeat:
+    while:
+    - condition: template
+      value_template: '{{ (states(''sensor.kc868_heater_heater_co_curve_offset_read'')|float(-99))|round(1) != (target|float)|round(1)
+        }}'
+    - condition: template
+      value_template: '{{ repeat.index <= 4 }}'
+    sequence:
+    - target:
+        entity_id: number.kc868_heater_heater_co_curve_offset
+      data:
+        value: '{{ target }}'
+      action: number.set_value
+    - delay:
+        seconds: 14
+- variables:
+    final: '{{ states(''sensor.kc868_heater_heater_co_curve_offset_read'')|float(0) }}'
+- data:
+    notification_id: kospel_komfort
+    title: 'Ogrzewanie: krzywa bazowa'
+    message: '{% if (final|float)|round(1) == (target|float)|round(1) %}Przesunięcie krzywej grzania = {{ final|round(0)|int
+      }} °C. Przesunięcie krzywej grzania ustawiono na 0 °C.{% else %}Kocioł zajęty (dezynfekcja/Turbo) — zmiana
+      nie weszła. Naciśnij ponownie za chwilę.{% endif %}
+
+
+      (Działa w trybie sterowania krzywą; w trybie ręcznym kocioł trzyma nastawę ręczną.)'
+  action: persistent_notification.create

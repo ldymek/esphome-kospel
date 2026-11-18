@@ -121,6 +121,12 @@ Włącz packages w `configuration.yaml`, potem skopiuj z `homeassistant/packages
   ceny godzinowej. Sumy żyją w statystykach długoterminowych → rozliczenie sezonu = koniec
   minus początek.
 
+`homeassistant/automations/` (każdy plik wklej jako nową automatyzację w trybie YAML) — powiadomienia
+o mocy/cenie i awariach, ochrona przeciwmrozowa, synchronizacja krzywej kocioł ↔ C.MG3, wznowienie CO po
+wietrzeniu, TRV: baterie / zawieszone alarmy / harmonogram nastaw. `homeassistant/scripts/` to przyciski
+krzywej *za zimno / za ciepło / reset*, których używają dashboardy. Zamień
+`notify.mobile_app_luke_iphone` na swój telefon.
+
 `homeassistant/dashboards/wall_panel.json` to gotowy widok panelu ściennego (wklej do dashboardu
 przez raw editor; mieści się na tablecie 1080p landscape bez scrollowania). Odwołuje się do dwóch
 zagregowanych sensorów z opcjonalnego setupu TRV (`sensor.dom_otwarte_okna`,
@@ -183,12 +189,19 @@ pojedynczo-rejestrowych).
 | Nastawy (CWU eko/komfort, pokój, CO max/ręczne, krzywe) | `0x0B62…0x0B8D` |
 | Programy dzienne (5 przedziałów × start/stop/poziom) | baza CO `0x0C1C`, CWU `0x0C9E`, cyrkulacja `0x0D20`, C.MG3 `0x0B90`; program *N* = baza + 15·(N−1) |
 | Przypisania tygodniowe (pn..nd) | CO `0x0C94-0x0C9A`, CWU `0x0D16-0x0D1C`, cyrk. `0x0D98-0x0D9E`, C.MG3 `0x0C08-0x0C0E` |
-| RTC | `0x0AF6` (7 rej.), zapisywany co godzinę z SNTP |
-| Keep-alive | zapis `{0x0000, 0x0100}` do `0x0BAE` co 10 s (heartbeat C.MI) |
+| Zegar | **broadcast**, adres `0x00`, funkcja `0x01`, co 60 s: `00 01 08 RR MM DD DT gg mm ss 00` + CRC (RR = rok−2000, DT 0 = poniedziałek). Ustawia zegar kotła i C.MG3. Odczyt: `0x0AF6…0x0AFC` (s, min, godz., dz. tyg., dzień, miesiąc, rok). **Bezpośredni zapis do `0x0AF6` kocioł odrzuca wyjątkiem 2** — C.MI nigdy tego nie robi |
+| Przekaźnik żądania ciepła | zapis 2 słów do `0x0BAE` co ~10 s: spoczynek `[0, 1]`; C.MG3 chce ciepła `[T×10, 3]`, T = nastawa modułu + 5 K |
+| Stan kotła → C.MG3 | **broadcast**, adres `0x00`, funkcja `0x02`, 18 słów co ~10 s — jedyne źródło, z którego moduł zna temperaturę pokojową/zewnętrzną, poziomy pokojowe i tryb kotła |
+| Identyfikacja | funkcja `0x11` (Report Slave ID): kocioł odpowiada `13 FF 00 01 32 01 14 01` → `01 32` = MSK 1.50, `01 14` = PW 1.20 (stąd C.MI pokazuje wersje programu) |
 
 Część rejestrów konfiguracyjnych zatrzaskuje się tylko, gdy słowo konfiguracyjne
 (`0x0B55`/`0x0B54`) zostanie ponownie zapisane w tej samej serii — generator obsługuje te
 „gated" zapisy.
+
+Oba broadcasty to obowiązek mastera magistrali (C.MI je wysyła, więc ESP też musi). Hub modbus
+w ESPHome odmawia ramek na adres 0, więc firmware zapisuje je wprost do UART-a (z CRC) w wolnej
+przerwie między odpytaniami, a `turnaround_time` huba jest skrócony do 50 ms.
+Testowane na MSK 1.50 / PW 1.20, 9600 8N1.
 
 ## Flagi konfiguracyjne i sezon
 
@@ -198,6 +211,13 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 
 ## Lekcje (te drogie)
 
+- **C.MI nigdy nie zapisuje rejestru zegara kotła — rozgłasza czas.** Pierwsze wydanie zapisywało blok
+  RTC `0x0AF6` co godzinę; kocioł odrzuca to wyjątkiem 2, a zegar tylko wyglądał dobrze, bo własny zegar
+  kotła był już poprawny. Zanim zaufasz mapie rejestrów, posłuchaj oryginalnego mastera dłużej: co 10 s rozgłasza też stan
+  kotła do C.MG3 i przekazuje żądanie ciepła modułu — te obowiązki przejmujesz, zastępując go.
+- **Hub modbus w ESPHome nie wyśle broadcastu** („a broadcast (address 0) is never answered"), a domyślny
+  `turnaround_time` 600 ms trzymał go zajętym ~85 % czasu. Ramki broadcast zapisuj do UART-a sam, gdy
+  `tx_blocked()` jest false, i skróć turnaround do 50 ms.
 - **Cykliczne odpytywanie `http_request` w ESPHome potrafi resetować połączenie API.**
   Okresowe 0,5-sekundowe „unavailable" w HA kwantowały się *dokładnie* do okresu odpytywania
   (dowód: zmiana interwału na pierwsze 127 s). Fix: odwrócenie na UDP push. Widzisz kropkowane
@@ -242,6 +262,31 @@ odzysku — patrz **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - **Audyt LLM to druga opinia, nie ostatnie słowo.** W trybie hybrydowym wskazał realne problemy, ale
   też sam sobie zaprzeczył („za dużo bloków Komfort", po czym dodał kolejny). Deterministyczne reguły
   są ostatnią bramką dla każdego autora.
+
+## Historia zmian
+
+**v2.5 (2026-11-18)**
+- **Naprawiony zegar:** czas idzie tak jak z C.MI — broadcastem raz na minutę (funkcja `0x01`) — zamiast
+  zapisu do `0x0AF6`, który MSK 1.50 / PW 1.20 odrzuca wyjątkiem 2.
+- **ESP przejmuje pełną rolę C.MI na magistrali:** przekaźnik żądania ciepła C.MG3 (`0x0BAE`), broadcast
+  stanu kotła (funkcja `0x02`) aktualizujący lustro kotła w module, transport broadcastów wprost przez
+  UART, turnaround huba 50 ms (opóźnienie odczytu na żądanie ~26 s → <1 s).
+- Odporny failsafe wietrzenia (trwała flaga; wyjście przy nieaktualnych danych TRV / zimnym pokoju / po
+  2 h), histereza limitu mocy, świeży read-modify-write przy zmianie sezonu.
+- **AI:** plan nigdy nie zależy od LLM; dom widziany przez TRV (deficyt względem nastaw, historia 24 h);
+  nastawy pokojowe kotła podążają za TRV (Komfort+ = najwyższa nastawa TRV); straż zimnego pokoju
+  (pokój TRV na/poniżej progu wymusza CO Komfort+); rozmowa z asystentem tekstem; opcjonalna korekta
+  komfortu na krzywej pogodowej C.MG3; oszczędności/backtest przeżywają restart HA.
+- **Silnik:** nie gubi ładowania CWU przy kompresji slotów; wybieg zależny od zaufania; audyt hybrydowy
+  nakłada poprawki CO na plan zamiast go zastępować.
+- **Home Assistant:** nowe automatyzacje (przeciwmrozowa, synchronizacja krzywej, wznowienie po
+  wietrzeniu, harmonogram TRV, zawieszone alarmy TRV), skrypty krzywej, cztery nowe helpery; moc CO
+  z debounce, żeby przejścia CWU nie liczyły się jako CO.
+- **Z-Wave:** agent czyta właściwe bity statusu FGT-001 i bieżącą baterię; automatyzacje self-heal
+  traktują odpowiedź REST jako gotowy JSON (filtr `from_json` psuł cotygodniową aktualizację).
+
+**v2.4 (2026-09-25)** — AI steruje sterownikiem obiegu C.MG3; HTTPS + opcjonalny klucz API dla
+endpointu LLM; sterowanie sezonem (v2.3).
 
 ## Roadmapa
 

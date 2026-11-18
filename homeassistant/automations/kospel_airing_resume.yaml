@@ -1,0 +1,64 @@
+# Airing: once fewer windows than the threshold have been open for 2 min, switch the boiler back to winter
+# (only if this automation set summer). Survives HA restarts; after 2 h of airing it resumes CH anyway and notifies.
+# Replace notify.mobile_app_luke_iphone with your phone's notify service (notify.mobile_app_<device>).
+alias: 'Kospel: wietrzenie — wznow CO'
+description: 'Okna zamknięte (mniej otwartych niż próg) od 2 min -> przywróć Zimę (tylko gdy to my przełączyliśmy).
+  Odporne na restart / przeładowanie automatyzacji (sprawdza też przy starcie i co 5 min). Po 2 h wietrzenia wznawia
+  CO mimo otwartych okien i powiadamia. Zmiana 2026-10-17: wcześniej wyzwalacz szablonowy mógł się nie odpalić po
+  restarcie, a powrót wymagał zamknięcia WSZYSTKICH okien.'
+triggers:
+- trigger: state
+  entity_id: sensor.dom_otwarte_okna
+  for:
+    minutes: 2
+- trigger: homeassistant
+  event: start
+- trigger: event
+  event_type: automation_reloaded
+- trigger: time_pattern
+  minutes: /5
+conditions:
+- condition: state
+  entity_id: input_boolean.kospel_wietrzenie_auto
+  state: 'on'
+- condition: or
+  conditions:
+  - condition: template
+    value_template: '{{ states(''sensor.dom_otwarte_okna'')|int(0) < states(''input_number.kospel_okna_prog'')|int(2)
+      and (now() - states.sensor.dom_otwarte_okna.last_changed).total_seconds() > 110 }}'
+  - condition: template
+    value_template: '{{ (now() - states.input_boolean.kospel_wietrzenie_auto.last_changed).total_seconds() > 7200
+      }}'
+actions:
+- variables:
+    za_dlugo: '{{ states(''sensor.dom_otwarte_okna'')|int(0) >= states(''input_number.kospel_okna_prog'')|int(2)
+      }}'
+- action: input_boolean.turn_off
+  target:
+    entity_id: input_boolean.kospel_wietrzenie_auto
+- condition: state
+  entity_id: select.kc868_heater_heater_mode
+  state: summer
+- action: select.select_option
+  target:
+    entity_id: select.kc868_heater_heater_mode
+  data:
+    option: winter
+- action: persistent_notification.create
+  data:
+    notification_id: kospel_wietrzenie
+    title: '{{ ''Wietrzenie — CO wznowione po 2 h'' if za_dlugo else ''Wietrzenie zakończone'' }}'
+    message: '{{ ''Okna nadal otwarte ('' ~ states(''sensor.dom_otwarte_okna'') ~ '') od 2 h — kocioł wrócił na
+      Zimę, żeby dom nie wychłodził się.'' if za_dlugo else ''Okna zamknięte — kocioł wrócił na tryb Zima.'' }}'
+- if:
+  - condition: template
+    value_template: '{{ za_dlugo }}'
+  then:
+  - action: notify.mobile_app_luke_iphone
+    data:
+      title: Wietrzenie — CO wznowione
+      message: Okna otwarte od 2 h — kocioł wrócił na Zimę.
+      data:
+        tag: kospel_wietrzenie
+        group: kociol
+mode: single

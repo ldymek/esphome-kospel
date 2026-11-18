@@ -28,15 +28,18 @@ def _solve3(A, b):
                 for k in range(c, n + 1): M[r][k] -= f * M[c][k]
     return [M[i][n] / M[i][i] for i in range(n)]
 
-def resample(series, t0, t1, dt):
-    """Step-hold resample of [(ts, value)] onto a grid t0..t1 (seconds). None where no data yet."""
-    out, i, cur = [], 0, None
+def resample(series, t0, t1, dt, max_hold=None):
+    """Step-hold resample of [(ts, value)] onto a grid t0..t1 (seconds). None where no data yet and,
+    with max_hold (s), where the last sample is older than that: a dead sensor or a history query that
+    returned less than the window must not become days of a flat-lining constant."""
+    out, i, cur, cur_t = [], 0, None, None
     s = sorted(series)
     t = t0
     while t <= t1:
         while i < len(s) and s[i][0] <= t:
-            cur = s[i][1]; i += 1
-        out.append(cur); t += dt
+            cur, cur_t = s[i][1], s[i][0]; i += 1
+        out.append(cur if max_hold is None or (cur_t is not None and t - cur_t <= max_hold) else None)
+        t += dt
     return out
 
 def slope_per_day(series):
@@ -49,25 +52,55 @@ def slope_per_day(series):
     return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
 
 # ----------------------------------------------------------------- thermal model
+# Trust gate for decisions that SKIP heating (coasting through the price peak). Lesson 2026-10-08..17:
+# the app's history query returned only the first 24 h of the 7-day window (HA /history/period/<start>
+# without end_time = start + 1 day); step-hold turned the other 6 days into a constant room temperature,
+# so 18 of 21 fits had heating_seen=False and tau jumped 3.4 h .. 497 h between refits, yet every one
+# was ok() and drove coasting. Re-fitting the same 7-day windows on the full history gives tau 45-108 h
+# (38 windows, 10-08..10-17; 45-95 h once heating is in the data) — the bounds below keep that with a
+# ~2x margin and reject the artefacts (3.4 h, 10 h; 226-497 h). A fit is trusted only if it saw heating,
+# found a positive heating gain, used >= 3 days of real (not held) rows and was made by this fit version.
+TAU_TRUST_H = (20.0, 200.0)
+TRUST_MIN_ROWS = 432             # 10-min rows = 72 h of usable data
+FIT_MAX_HOLD_S = 6 * 3600        # room/outdoor sensors report at least every ~5.3 h (max normal gap seen)
+FIT_VERSION = 2                  # fits without the hold limit (fit_v missing) are never trusted
+
 class ThermalModel:
     """dT_in/dt = a*(T_out - T_in) + b*P_co + c   (a: loss rate 1/s, b: heating gain K/s/kW,
-    c: internal/solar gains K/s). Fitted by least squares on 10-min resampled history."""
+    c: internal/solar gains K/s). Fitted by least squares on 10-min resampled history.
+    ok() = a fit exists (published model info); trusted() = good enough to decide coasting."""
     def __init__(self, d=None):
         d = d or {}
         self.a, self.b, self.c = d.get("a"), d.get("b"), d.get("c")
         self.n, self.rmse, self.fitted_at = d.get("n", 0), d.get("rmse"), d.get("fitted_at")
         self.heating_seen = d.get("heating_seen", False)
+        self.fit_v = d.get("fit_v")
 
     def to_dict(self):
         return {"a": self.a, "b": self.b, "c": self.c, "n": self.n, "rmse": self.rmse,
-                "fitted_at": self.fitted_at, "heating_seen": self.heating_seen}
+                "fitted_at": self.fitted_at, "heating_seen": self.heating_seen, "fit_v": self.fit_v}
 
     def ok(self): return self.a is not None and self.a > 0 and self.n >= 48
     def tau_h(self): return (1.0 / self.a) / 3600.0 if self.ok() else None
 
+    def trust_issue(self):
+        """None if the model may decide to leave hours unheated; otherwise why not (Polish, for notes)."""
+        if not self.ok(): return "model termiczny jeszcze bez dopasowania"
+        if (self.fit_v or 0) < FIT_VERSION: return "dopasowanie sprzed poprawki danych (czeka na ponowne dopasowanie)"
+        if not self.heating_seen or not self.b or self.b <= 0: return "model jeszcze bez danych grzania"
+        if self.n < TRUST_MIN_ROWS: return f"za mało danych ({self.n} próbek < {TRUST_MIN_ROWS})"
+        tau = self.tau_h()
+        if not TAU_TRUST_H[0] <= tau <= TAU_TRUST_H[1]:
+            return f"stała czasowa {tau:.0f} h poza wiarygodnym zakresem {TAU_TRUST_H[0]:.0f}-{TAU_TRUST_H[1]:.0f} h"
+        return None
+
+    def trusted(self): return self.trust_issue() is None
+
     def fit(self, tin, tout, pco, t0, t1, dt=600):
         """tin/tout/pco: [(ts,val)] series. Returns True if a usable model was fitted."""
-        Ti = resample(tin, t0, t1, dt); To = resample(tout, t0, t1, dt); P = resample(pco, t0, t1, dt)
+        self.fit_v = None                                # a failed refit is not trusted on stale parameters
+        Ti = resample(tin, t0, t1, dt, max_hold=FIT_MAX_HOLD_S); To = resample(tout, t0, t1, dt, max_hold=FIT_MAX_HOLD_S)
+        P = resample(pco, t0, t1, dt)                    # power: constant for days is real (no state changes)
         rows = []
         for k in range(len(Ti) - 1):
             if None in (Ti[k], Ti[k + 1], To[k]): continue
@@ -99,6 +132,7 @@ class ThermalModel:
         err = [(y - (a * x1 + (b or 0) * x2 + c)) ** 2 for x1, x2, y in rows]
         self.rmse = math.sqrt(sum(err) / len(err)) * 3600  # K/h
         self.fitted_at = time.time()
+        self.fit_v = FIT_VERSION
         return True
 
     def coast_hours(self, tin0, tout, tmin):
@@ -254,6 +288,108 @@ def _to_quarters(slots):
         for i in range(max(0, a // 15), min(96, (b + 14) // 15)): q[i] = lv
     return q
 
+# ---- slot budget for CWU / circulation (never through _compress/_compress_q: those merge a short slot into
+# its neighbour ADOPTING the neighbour's level — right for CO, fatal for the tank). Lesson 2026-10-09/12: night
+# Ochrona 00-0x + the 23:00 Ochrona tail + 1 h charges = 6 slots; the merge turned the 04:00 charge into Ochrona
+# (no heating before the 06:00 showers) or deleted the morning charge, while the notes said it was added.
+def _runs(levels, qmin):
+    """Per-bucket levels (None = gap) -> [(start_min, stop_min, level)] of equal consecutive buckets."""
+    slots = []
+    for i, lv in enumerate(levels):
+        if lv is None: continue
+        a, b = i * qmin, (i + 1) * qmin
+        if slots and slots[-1][2] == lv and slots[-1][1] == a: slots[-1] = (slots[-1][0], b, lv)
+        else: slots.append((a, b, lv))
+    return slots
+
+def _span(s): return f"{s[0]//60:02d}:{s[0]%60:02d}-{min(s[1], 1439)//60:02d}:{min(s[1], 1439)%60:02d}"
+
+def _cwu_needs(usage, pk=None):
+    """What a CWU Komfort charge is for: each draw cluster (a charge in the 4 h before it or in its first
+    hour — the enforce_rules (b2) window) and the pre-peak charge (the 3 h before the price peak).
+    -> [(label, start_min, stop_min)] windows."""
+    needs = [(f"pobór {hs:02d}-{he + 1:02d}", max(0, hs - 4) * 60, (hs + 1) * 60) for hs, he in usage_clusters(usage)]
+    if pk: needs.append((f"szczyt cen {pk[0]:02d}-{pk[1]:02d}", max(0, pk[0] - 3) * 60, pk[0] * 60))
+    return needs
+
+def _charge(s): return s[2] in (KOMFORT, KOMFORT_PLUS)
+def _serves(s, need): return _charge(s) and s[0] < need[2] and s[1] > need[1]
+
+def _fit_cwu(slots, max_slots=5, usage=None, pk=None, now_hour=None, tank_temp=None):
+    """CWU slots over the heater's budget -> (slots, notes). Only DROPS slots, never merges:
+    1) Ochrona first, shortest first (the 23:00 tail before the 00-05 block): a dropped Ochrona is a gap =
+       the heater's economic 39 °C upkeep — a cost, never a cold tank;
+    2) only if the charges alone exceed the budget: the charge of least value (a tank-floor charge NOW is
+       kept; then charges that are the only one serving a draw cluster / the pre-peak charge; then the
+       stronger coming draws). Lost coverage is reported, never hidden."""
+    slots = sorted(slots)
+    if len(slots) <= max_slots: return [(a, min(b, 1439), lv) for a, b, lv in slots], []
+    needs = _cwu_needs(usage, pk)
+    before = {n for n in needs if any(_serves(s, n) for s in slots)}
+    dropped = []
+    def value(k):
+        s, rest = slots[k], slots[:k] + slots[k + 1:]
+        floor_now = (now_hour is not None and tank_temp is not None and tank_temp < CWU_FLOOR_HEAT
+                     and s[0] <= now_hour * 60 < s[1])
+        sole = sum(1 for n in needs if _serves(s, n) and not any(_serves(t, n) for t in rest))
+        h1 = (min(s[1], 1440) - 1) // 60
+        nxt = sum((usage[x] if x < len(usage) else 0.0) for x in range(h1 + 1, min(24, h1 + 4))) if usage else 0.0
+        return (floor_now, sole, nxt, -s[0])
+    while len(slots) > max_slots:
+        cool = [k for k, s in enumerate(slots) if not _charge(s)]
+        k = (min(cool, key=lambda k: (slots[k][1] - slots[k][0], -slots[k][0])) if cool
+             else min(range(len(slots)), key=value))
+        dropped.append(slots.pop(k))
+    notes = []
+    och = [_span(s) for s in sorted(dropped) if not _charge(s)]
+    chg = [_span(s) for s in sorted(dropped) if _charge(s)]
+    if och: notes.append(f"CWU: limit {max_slots} przedziałów sterownika -> pominięta Ochrona {', '.join(och)} "
+                         f"(w tych godzinach podtrzymanie ekonomiczne zamiast braku grzania; ładowania zostają)")
+    if chg: notes.append(f"CWU: limit {max_slots} przedziałów -> usunięte ładowanie {', '.join(chg)} (najmniej potrzebne)")
+    lost = [n[0] for n in needs if n in before and not any(_serves(s, n) for s in slots)]
+    if lost: notes.append(f"CWU: UWAGA — przez limit przedziałów bez ładowania: {', '.join(lost)}")
+    return [(a, min(b, 1439), lv) for a, b, lv in slots], notes
+
+def _fit_circ(slots, max_slots=4, usage=None):
+    """Circulation over budget -> (slots, notes): drop the slot with the weakest observed draws (draw weight
+    summed over its quarters), ties -> the shorter, then the later. Circulation is comfort only (hot water
+    at the tap sooner); a dropped slot cools the tank less, it never starves it."""
+    slots = sorted(slots)
+    def weight(s): return sum((usage[i // 4] if usage and i // 4 < len(usage) else 0.0)
+                              for i in range(s[0] // 15, min(96, (s[1] + 14) // 15)))
+    dropped = []
+    while len(slots) > max_slots:
+        k = min(range(len(slots)), key=lambda k: (weight(slots[k]), slots[k][1] - slots[k][0], -slots[k][0]))
+        dropped.append(slots.pop(k))
+    notes = [f"Cyrkulacja: limit {max_slots} przedziałów -> pominięte {', '.join(_span(s) for s in sorted(dropped))} (najsłabszy pobór)"] if dropped else []
+    return [(a, min(b, 1439), lv) for a, b, lv in slots], notes
+
+def _price_fns(hours):
+    """(price, est): price(h) = the published price or None; est(h) = the price used to CHOOSE a charge hour.
+    A missing price is not 'very expensive': in the rolling day it is an hour already past (tomorrow's, until
+    the day-ahead prices are out) — valuing it at 9 zł moved the morning charge to 'now' on every morning
+    re-plan (2026-10-09/10: charges at 05:01 and again 06:3x). est = the caller's hours[h]['price_est'] if
+    supplied, else the median of the known prices (1.0 with no prices at all)."""
+    def price(h): return (hours[h] or {}).get("price") if hours and h < len(hours) else None
+    kp = sorted(p for p in (price(h) for h in range(24)) if p is not None)
+    med = ((kp[len(kp) // 2] if len(kp) % 2 else (kp[len(kp) // 2 - 1] + kp[len(kp) // 2]) / 2) if kp else 1.0)
+    def est(h):
+        p = price(h)
+        if p is not None: return p
+        e = (hours[h] or {}).get("price_est") if hours and h < len(hours) else None
+        return e if e is not None else med
+    return price, est
+
+def _rolling_now(hours):
+    """'Now' of a rolling-day price list (kospel_llm.hours_from_prices): until the day-ahead prices are
+    published, the hours already past have no price, so an unknown prefix 0..k-1 followed by known k..23
+    means now = k. Any other pattern (all known, gaps) -> None."""
+    if not hours or len(hours) < 24: return None
+    known = [bool(hours[h] and hours[h].get("price") is not None) for h in range(24)]
+    if all(known) or not any(known): return None
+    k = known.index(True)
+    return k if k > 0 and all(known[k:]) else None
+
 def peak_block(hours, max_len=5, rel=0.85):
     """Contiguous block of hours around the day's max price (>= rel*max), <= max_len hours."""
     known = [h for h in range(24) if hours and h < len(hours) and hours[h] and hours[h].get("price") is not None]
@@ -274,7 +410,7 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, 
     P = PREF.get(pref, PREF["Balans"])
     notes = []
     if not slots or key not in ("CWU", "Cyrkulacja"): return slots, notes
-    def price(h): return (hours[h] or {}).get("price") if hours and h < len(hours) else None
+    price, est = _price_fns(hours)
     pk = peak_block(hours)
     peak = set(range(pk[0], pk[1])) if pk else set()
     def exp(h): return h in peak
@@ -314,7 +450,11 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, 
                 if any(q[i] in (KOMFORT, KOMFORT_PLUS) for h in win for i in range(h * 4, h * 4 + 4)): continue
                 if now_hour is not None and hs < now_hour: continue          # already in the past today
                 cands = [h for h in win if h not in peak and h != hs] or [h for h in win if h != hs] or win
-                best = min(cands, key=lambda h: ((price(h) if price(h) is not None else 9) + 0.03 * (hs - h), -h))
+                if now_hour is not None and hs > now_hour:
+                    # a NEW charge for a draw still ahead today: an hour already past cannot serve it (in the
+                    # rolling day it is tomorrow's hour, possibly with tomorrow's cheap price)
+                    cands = [h for h in cands if h >= now_hour] or [h for h in win if h >= now_hour] or cands
+                best = min(cands, key=lambda h: (est(h) + 0.03 * (hs - h), -h))
                 for i in range(best * 4, best * 4 + 4): q[i] = KOMFORT
                 notes.append(f"CWU: dodano ładowanie o {best:02d}:00 przed poborem {hs:02d}-{he+1:02d}")
         # (c) Komfort budget: the tank is charged for at most cwu_komfort_cap_h hours a day; keep the
@@ -370,12 +510,15 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, 
             if tank_temp < CWU_FLOOR_HEAT:
                 for i in range(now_hour * 4, min(96, now_hour * 4 + 4)): q[i] = KOMFORT
                 notes.append(f"CWU: zasobnik {tank_temp:.0f} °C < {CWU_FLOOR_HEAT:.0f} -> grzanie TERAZ ({now_hour:02d}:00) niezależnie od ceny")
-        return _compress_q(q, 5), notes
+        out, fit_notes = _fit_cwu(_runs(q, 15), 5, usage, pk, now_hour, tank_temp)
+        return out, notes + fit_notes
     if key == "Cyrkulacja":
         for i in range(96):
             if q[i] is not None and q[i] != KOMFORT: q[i] = KOMFORT   # circulation slots are on/off; level is always 2
         exp_hours = [h for h in range(24) if exp(h)]
-        if not exp_hours: return _compress_q(q, 4), notes
+        if not exp_hours:
+            out, fit_notes = _fit_circ(_runs(q, 15), 4, usage)
+            return out, notes + fit_notes
         on = [i for i in range(96) if q[i] is not None]
         if not on: return slots, notes
         def weight(i):  # prefer quarters in hours with observed draws
@@ -394,7 +537,8 @@ def enforce_rules(key, slots, hours, pref="Balans", usage=None, tank_temp=None, 
             for i in on:
                 if i not in keep: q[i] = None
             notes.append(f"Cyrkulacja: łącznie skrócona do {cap_day/4:g} h/dobę")
-        return _compress_q(q, 4), notes
+        out, fit_notes = _fit_circ(_runs(q, 15), 4, usage)
+        return out, notes + fit_notes
     return slots, notes
 
 def human(slots):
@@ -411,15 +555,30 @@ def usage_clusters(usage, frac=0.15):
         else: cl.append((h, h))
     return cl
 
+def directive_hours(d):
+    """Local hours a user directive covers: od..do (do=24 or od==do -> whole day; od>do wraps midnight)."""
+    od, do = int(d.get("od", 0)) % 24, int(d.get("do", 24))
+    if do >= 24: do = 0
+    if od == do: return list(range(24))
+    return list(range(od, do)) if od < do else list(range(od, 24)) + list(range(0, do))
+
+_WARMTH = {OCHRONA: 0, None: 1, KOMFORT_MINUS: 2, KOMFORT: 3, KOMFORT_PLUS: 4}   # CO level ranked by warmth
+_BY_WARMTH = {v: k for k, v in _WARMTH.items()}
+
 def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
-         tin=None, tout=None, battery=False, comfort_windows=None):
-    """hours: 24 dicts {price, cheap, exp} indexed by LOCAL hour (rolling day, missing -> None).
+         tin=None, tout=None, battery=False, comfort_windows=None, directive=None, now_hour=None):
+    """hours: 24 dicts {price, cheap, exp[, price_est]} indexed by LOCAL hour (rolling day, missing -> None).
+    directive: a user's free-text instruction already interpreted by the LLM and validated by the app:
+    {komfort -2..+2, od, do, tekst} -> CO levels in those hours are forced warmer/cooler (see below).
+    now_hour: current local hour for a live plan (None: inferred from the rolling-day price gap, or none
+    for a backtest day).
     Returns dict: CO/CWU/Cyrkulacja slots, power_plan[24], rationale[], model_used."""
     P = PREF.get(pref, PREF["Balans"])
     cw = comfort_windows or DEFAULT_COMFORT_WINDOWS
     bias = bias or [0.0] * 24
     notes = []
-    def price(h): return (hours[h] or {}).get("price")
+    price, est = _price_fns(hours)                                   # est: missing price -> estimate (charge placement)
+    now = now_hour if now_hour is not None else _rolling_now(hours)
     def exp_flag(h): return bool((hours[h] or {}).get("exp"))       # Pstryk flag: power-plan tiers only
     pk = peak_block(hours)
     peak = set(range(pk[0], pk[1])) if pk else set()
@@ -447,11 +606,16 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
                 while h + blk < 24 and exp(h + blk): blk += 1
                 pre = h - 1
                 if pre < 0 or exp(pre): continue
-                coast = None
-                if thermal and thermal.ok() and tin is not None and tout is not None:
+                # coasting (block unheated) only on a TRUSTED model; otherwise the block keeps the
+                # conservative P['peak'] level set above (Komfort- in Balans)
+                coast, why = None, (thermal.trust_issue() if thermal else "brak modelu termicznego")
+                if why is None and (tin is None or tout is None): why = "brak temperatury wewnątrz/na zewnątrz"
+                if why is None:
                     coast = thermal.coast_hours(tin + 0.8, tout, tin - P["tmin_off"])
                 if coast is None:
-                    if pref != "Oszczędność": co[pre] = KOMFORT_PLUS; notes.append(f"{pre:02d}:00 Komfort+ (rozgrzanie przed drogim blokiem {h:02d}-{h+blk:02d}; model termiczny jeszcze bez danych grzania)")
+                    if pref != "Oszczędność": co[pre] = KOMFORT_PLUS
+                    notes.append(f"{pre:02d}:00 " + ("Komfort+ (rozgrzanie); " if pref != "Oszczędność" else "")
+                                 + f"blok {h:02d}-{h+blk:02d} bez coastingu ({why}) -> {LEVEL_NAME[P['peak']]}")
                 elif coast >= blk:
                     co[pre] = KOMFORT_PLUS
                     for k in range(h, h + blk): co[k] = None    # coast: heater economic floor, no slot
@@ -464,6 +628,20 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
             if bias[h] > 0.5 and co[h] in (None, OCHRONA, KOMFORT_MINUS): co[h] = KOMFORT
             if bias[h] < -0.5 and co[h] in (KOMFORT_PLUS, KOMFORT): co[h] = KOMFORT_MINUS
         if any(abs(b) > 0.5 for b in bias): notes.append("Uwzględniono nauczone preferencje (za zimno/za ciepło).")
+        # user directive ("jest mi zimno", "oszczędzaj do wieczora"): +1 = at least Komfort, +2 = Komfort+,
+        # -1 = at most Komfort-, -2 = Ochrona, in the directive's hours. Price is deliberately ignored here —
+        # the user said so; the cost is reported back to them in the reply.
+        k = int((directive or {}).get("komfort", 0) or 0)
+        if directive and k:
+            hs = directive_hours(directive)
+            floor_rank = {1: 3, 2: 4}.get(k); cap_rank = {-1: 2, -2: 0}.get(k)
+            for h in hs:
+                r = _WARMTH[co[h]]
+                if floor_rank is not None and r < floor_rank: co[h] = _BY_WARMTH[floor_rank]
+                if cap_rank is not None and r > cap_rank: co[h] = _BY_WARMTH[cap_rank]
+            span = f"{hs[0]:02d}:00-{(hs[-1] + 1) % 24:02d}:00" if len(hs) < 24 else "cały dzień"
+            notes.append(f"Polecenie użytkownika „{str(directive.get('tekst', ''))[:60]}”: "
+                         f"{'cieplej' if k > 0 else 'chłodniej'} ({k:+d}) {span} — ceny pominięte w tych godzinach.")
     co_slots = _compress(co)
 
     # ---- CWU ----
@@ -475,15 +653,20 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
                 notes.append(f"CWU: pobór {hs:02d}-{he+1:02d} pokryty wcześniejszym nagrzaniem (zasobnik trzyma ciepło)")
                 continue
             win = list(range(max(0, hs - 5), hs + 1))
+            if now is not None and hs <= now:
+                # draw already under way today: its charge is for TOMORROW's occurrence, in the hours before
+                # it — never 'now' (2026-10-09/10: the 06:05 re-plan charged at 06:00 again after 05:01)
+                win = [h for h in win if h < now] or win
             cands = [h for h in win if not exp(h)]
             if not cands:
                 cands = win; notes.append(f"CWU: przed poborem {hs:02d}-{he+1:02d} tylko drogie godziny -> najtańsza z nich")
-            best = min(cands, key=lambda h: (price(h) if price(h) is not None else 9) - (0.05 if cheap(h) else 0) + 0.03 * (hs - h))  # later = less standing loss
+            best = min(cands, key=lambda h: est(h) - (0.05 if cheap(h) else 0) + 0.03 * (hs - h))  # later = less standing loss
             dur_h = 1
             if tank:
                 dur_h = max(1, int(math.ceil(tank.minutes_to_heat(38.0, 48.0, 20.0) / 60.0)))
             for k in range(best, min(24, best + dur_h)): cwu[k] = KOMFORT
-            notes.append(f"CWU: nagrzewanie o {best:02d}:00 przed poborem {hs:02d}-{he+1:02d}" + (f" ({price(best)} zł/kWh)" if price(best) is not None else ""))
+            notes.append(f"CWU: nagrzewanie o {best:02d}:00 przed poborem {hs:02d}-{he+1:02d}"
+                         + (f" ({price(best)} zł/kWh)" if price(best) is not None else f" (cena jeszcze nieznana, szacunek {est(best):.2f} zł/kWh)"))
     else:
         for h in (6, 17): cwu[h] = KOMFORT
         notes.append("CWU: brak profilu poboru -> domyślne 06:00 i 17:00")
@@ -514,7 +697,8 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
     if away:
         cwu = [None] * 24; cwu[6] = KOMFORT
         notes.append("Nikogo w domu -> CWU tylko jedno podtrzymanie o 06:00.")
-    cwu_slots = _compress(cwu)
+    cwu_slots, fit_notes = _fit_cwu(_runs(cwu, 60), 5, usage, pk if not away else None)
+    notes += fit_notes
 
     # ---- circulation ----
     circ = [None] * 24
@@ -533,7 +717,8 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
             notes.append(f"Cyrkulacja: {tot} h/dobę tylko w godzinach najsilniejszego poboru (krążenie chłodzi zasobnik ~3 K/h" + (", w drogich godzinach max %g h)" % P["circ_exp_cap_h"] if any(exp(k) for k in range(24)) else ")"))
         else:
             for k in (6, 7, 18, 19): circ[k] = KOMFORT
-    circ_slots = _compress(circ, max_slots=4)
+    circ_slots, fit_notes = _fit_circ(_runs(circ, 60), 4, usage)
+    notes += fit_notes
 
     # ---- power plan ----
     t_exp, t_norm, t_cheap = P["tiers"]
@@ -546,6 +731,8 @@ def plan(hours, usage, thermal, tank, pref="Balans", away=False, bias=None,
     return {"CO": co_slots, "CWU": cwu_slots, "Cyrkulacja": circ_slots, "power_plan": power,
             "rationale": notes, "pref": pref, "away": away, "battery_hour": battery_hour, "prepeak_hour": prepeak_hour,
             "model": {"thermal_ok": bool(thermal and thermal.ok()), "tau_h": thermal.tau_h() if thermal and thermal.ok() else None,
+                      "thermal_trusted": bool(thermal and thermal.trusted()),
+                      "thermal_note": (thermal.trust_issue() if thermal else "brak modelu termicznego"),
                       "tank_rate_per_kw": tank.rate_per_kw if tank else None}}
 
 def validate_slots(slots):

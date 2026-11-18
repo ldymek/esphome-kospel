@@ -1,260 +1,272 @@
 {
- "views": [
-  {
-   "title": "Ustawienia",
-   "path": "ustawienia",
-   "icon": "mdi:cog",
-   "type": "sections",
-   "max_columns": 3,
-   "sections": [
+  "views": [
     {
-     "type": "grid",
-     "cards": [
-      {
-       "type": "heading",
-       "heading": "Asystent AI — silnik (Ollama)",
-       "heading_style": "title",
-       "icon": "mdi:brain"
-      },
-      {
-       "type": "entities",
-       "entities": [
+      "title": "Ustawienia",
+      "path": "ustawienia",
+      "icon": "mdi:cog",
+      "type": "sections",
+      "max_columns": 3,
+      "sections": [
         {
-         "entity": "input_text.kospel_llm_host",
-         "name": "Adres serwera Ollama"
+          "type": "grid",
+          "cards": [
+            {
+              "type": "heading",
+              "heading": "Asystent AI — silnik (Ollama)",
+              "heading_style": "title",
+              "icon": "mdi:brain"
+            },
+            {
+              "type": "entities",
+              "entities": [
+                {
+                  "entity": "input_text.kospel_llm_host",
+                  "name": "Adres serwera Ollama"
+                },
+                {
+                  "entity": "input_select.kospel_llm_model",
+                  "name": "Model"
+                },
+                {
+                  "entity": "input_boolean.kospel_llm_thinking",
+                  "name": "Tryb myślenia (wolniejszy)"
+                },
+                {
+                  "entity": "input_number.kospel_llm_temperatura",
+                  "name": "Temperatura (kreatywność)"
+                },
+                {
+                  "entity": "input_number.kospel_llm_interwal_h",
+                  "name": "Interwał analiz [h]"
+                }
+              ]
+            },
+            {
+              "type": "markdown",
+              "content": "Model musi być wcześniej pobrany na serwerze (`ollama pull <model>`). Zmiany działają od następnej analizy."
+            }
+          ]
         },
         {
-         "entity": "input_select.kospel_llm_model",
-         "name": "Model"
+          "type": "grid",
+          "cards": [
+            {
+              "type": "heading",
+              "heading": "Planer AI — silnik i preferencje",
+              "heading_style": "title",
+              "icon": "mdi:engine"
+            },
+            {
+              "type": "entities",
+              "entities": [
+                {
+                  "entity": "input_select.kospel_planer",
+                  "name": "Kto planuje (LLM / Silnik / Hybryda)"
+                },
+                {
+                  "entity": "input_boolean.kospel_ai_sezon_auto",
+                  "name": "AI steruje sezonem (lato/zima)"
+                },
+                {
+                  "entity": "sensor.kospel_ai_sezon",
+                  "name": "Decyzja AI o sezonie",
+                  "secondary_info": "last-updated"
+                },
+                {
+                  "entity": "input_select.kospel_preferencja",
+                  "name": "Preferencja: koszt vs komfort"
+                },
+                {
+                  "entity": "input_boolean.kospel_zawor_mieszajacy",
+                  "name": "Magazyn ciepła CWU (tylko z zaworem mieszającym!)"
+                },
+                {
+                  "entity": "input_number.kospel_cwu_magazyn_temp",
+                  "name": "Temp. magazynu CWU"
+                },
+                {
+                  "entity": "input_number.kospel_cwu_przed_szczytem_temp",
+                  "name": "Ładowanie przed szczytem cen do (45 = wył.; >50 tylko z zaworem)"
+                },
+                {
+                  "entity": "input_number.kospel_taryfa_plaska",
+                  "name": "Taryfa płaska do porównań"
+                },
+                {
+                  "entity": "input_boolean.kospel_backtest_run",
+                  "name": "Uruchom backtest (wczoraj)"
+                }
+              ]
+            },
+            {
+              "type": "markdown",
+              "content": "**LLM** — model językowy projektuje programy (dotychczasowe zachowanie). **Silnik** — deterministyczny planer (model termiczny + profil poboru + ceny). **Hybryda** — silnik planuje, LLM audytuje i może poprawić. Plan silnika jest zawsze publikowany do podglądu, niezależnie od trybu. **Ładowanie przed szczytem** podnosi nastawę CWU tylko w ostatniej tańszej godzinie przed dziennym szczytem cen (silnik wskazuje godzinę), żeby duży wieczorny pobór nie wymuszał grzania pełną mocą po najdroższej cenie; 45 = wyłączone, powyżej 50 °C wymaga zaworu mieszającego. Magazyn ciepła podnosi temperaturę zasobnika w najtańszej godzinie — **włącz tylko, jeśli masz zawór mieszający** (ryzyko poparzenia)."
+            }
+          ]
         },
         {
-         "entity": "input_boolean.kospel_llm_thinking",
-         "name": "Tryb myślenia (wolniejszy)"
+          "type": "grid",
+          "cards": [
+            {
+              "type": "heading",
+              "heading": "Pstryk — ceny energii",
+              "heading_style": "title",
+              "icon": "mdi:cash-clock"
+            },
+            {
+              "type": "entities",
+              "entities": [
+                {
+                  "entity": "input_text.kospel_pstryk_api_key",
+                  "name": "Klucz API (pstryk.pl)"
+                },
+                {
+                  "entity": "sensor.kospel_cena_zakupu_teraz",
+                  "name": "Cena teraz (test działania)"
+                }
+              ]
+            },
+            {
+              "type": "markdown",
+              "content": "Klucz z portalu pstryk.pl → Integracje → API. To pole to nadpisanie działające od ręki; docelowo klucz trzymaj w `secrets.yaml` AppDaemona (`pstryk_api_key`, patrz apps.yaml). Kolejność: to pole → apps.yaml → plik `.pstryk-key`."
+            }
+          ]
         },
         {
-         "entity": "input_number.kospel_llm_temperatura",
-         "name": "Temperatura (kreatywność)"
+          "type": "grid",
+          "cards": [
+            {
+              "type": "heading",
+              "heading": "Guardraile autonomii",
+              "heading_style": "title",
+              "icon": "mdi:shield-check"
+            },
+            {
+              "type": "entities",
+              "entities": [
+                {
+                  "entity": "input_number.kospel_ai_min_pokoj",
+                  "name": "Minimalna temp. pokojowa"
+                },
+                {
+                  "entity": "input_number.kospel_ai_prog_zimny_pokoj",
+                  "name": "Próg zimnego pokoju (wymusza grzanie)"
+                },
+                {
+                  "entity": "sensor.kospel_ai_zimny_pokoj",
+                  "name": "Straż zimnego pokoju"
+                },
+                {
+                  "entity": "input_boolean.kospel_ai_trv_nastawy",
+                  "name": "Nastawy pokojowe kotła wg TRV (Komfort+ = najwyższa nastawa TRV)"
+                },
+                {
+                  "entity": "input_number.kospel_okna_prog",
+                  "name": "Próg otwartych okien (wietrzenie)"
+                },
+                {
+                  "entity": "input_boolean.kospel_wietrzenie_auto",
+                  "name": "Automatyka wietrzenia"
+                },
+                {
+                  "entity": "input_boolean.kospel_ai_moc_auto",
+                  "name": "Limit mocy wg cen (12/20/24 kW)"
+                }
+              ]
+            }
+          ]
         },
         {
-         "entity": "input_number.kospel_llm_interwal_h",
-         "name": "Interwał analiz [h]"
+          "type": "grid",
+          "cards": [
+            {
+              "type": "heading",
+              "heading": "Z-Wave — kontrolery (Pi)",
+              "heading_style": "title",
+              "icon": "mdi:z-wave"
+            },
+            {
+              "type": "entities",
+              "entities": [
+                {
+                  "entity": "sensor.zwave_home_health",
+                  "name": "Dom — kontener zdrowy"
+                },
+                {
+                  "entity": "sensor.zwave_garage_health",
+                  "name": "Garaż — kontener zdrowy"
+                },
+                {
+                  "entity": "sensor.kc868_heater_trv_najzimniejszy_pokoj_esp",
+                  "name": "TRV → ESP (świeżość danych)"
+                }
+              ]
+            },
+            {
+              "type": "horizontal-stack",
+              "cards": [
+                {
+                  "type": "button",
+                  "name": "Restart DOM",
+                  "icon": "mdi:restart",
+                  "tap_action": {
+                    "action": "call-service",
+                    "service": "rest_command.zwave_restart_home",
+                    "confirmation": {
+                      "text": "Zrestartować kontener zwave-js (dom)?"
+                    }
+                  }
+                },
+                {
+                  "type": "button",
+                  "name": "Restart GARAŻ",
+                  "icon": "mdi:restart",
+                  "tap_action": {
+                    "action": "call-service",
+                    "service": "rest_command.zwave_restart_garage",
+                    "confirmation": {
+                      "text": "Zrestartować kontener zwave-js (garaż)?"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "type": "horizontal-stack",
+              "cards": [
+                {
+                  "type": "button",
+                  "name": "Update DOM",
+                  "icon": "mdi:update",
+                  "tap_action": {
+                    "action": "call-service",
+                    "service": "rest_command.zwave_update_home",
+                    "confirmation": {
+                      "text": "Zaktualizować obraz zwave-js (dom)? Rollback-safe."
+                    }
+                  }
+                },
+                {
+                  "type": "button",
+                  "name": "Update GARAŻ",
+                  "icon": "mdi:update",
+                  "tap_action": {
+                    "action": "call-service",
+                    "service": "rest_command.zwave_update_garage",
+                    "confirmation": {
+                      "text": "Zaktualizować obraz zwave-js (garaż)? Rollback-safe."
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "type": "markdown",
+              "content": "Kontrolery aktualizują się same (niedziela 04:00) i restartują po awarii — te przyciski są do ręcznej interwencji."
+            }
+          ]
         }
-       ]
-      },
-      {
-       "type": "markdown",
-       "content": "Model musi być wcześniej pobrany na serwerze (`ollama pull <model>`). Zmiany działają od następnej analizy."
-      }
-     ]
-    },
-    {
-     "type": "grid",
-     "cards": [
-      {
-       "type": "heading",
-       "heading": "Planer AI — silnik i preferencje",
-       "heading_style": "title",
-       "icon": "mdi:engine"
-      },
-      {
-       "type": "entities",
-       "entities": [
-        {
-         "entity": "input_select.kospel_planer",
-         "name": "Kto planuje (LLM / Silnik / Hybryda)"
-        },
-        {
-         "entity": "input_boolean.kospel_ai_sezon_auto",
-         "name": "AI steruje sezonem (lato/zima)"
-        },
-        {
-         "entity": "sensor.kospel_ai_sezon",
-         "name": "Decyzja AI o sezonie",
-         "secondary_info": "last-updated"
-        },
-        {
-         "entity": "input_select.kospel_preferencja",
-         "name": "Preferencja: koszt vs komfort"
-        },
-        {
-         "entity": "input_boolean.kospel_zawor_mieszajacy",
-         "name": "Magazyn ciepła CWU (tylko z zaworem mieszającym!)"
-        },
-        {
-         "entity": "input_number.kospel_cwu_magazyn_temp",
-         "name": "Temp. magazynu CWU"
-        },
-        {
-         "entity": "input_number.kospel_cwu_przed_szczytem_temp",
-         "name": "Ładowanie przed szczytem cen do (45 = wył.; >50 tylko z zaworem)"
-        },
-        {
-         "entity": "input_number.kospel_taryfa_plaska",
-         "name": "Taryfa płaska do porównań"
-        },
-        {
-         "entity": "input_boolean.kospel_backtest_run",
-         "name": "Uruchom backtest (wczoraj)"
-        }
-       ]
-      },
-      {
-       "type": "markdown",
-       "content": "**LLM** — model językowy projektuje programy (dotychczasowe zachowanie). **Silnik** — deterministyczny planer (model termiczny + profil poboru + ceny). **Hybryda** — silnik planuje, LLM audytuje i może poprawić. Plan silnika jest zawsze publikowany do podglądu, niezależnie od trybu. **Ładowanie przed szczytem** podnosi nastawę CWU tylko w ostatniej tańszej godzinie przed dziennym szczytem cen (silnik wskazuje godzinę), żeby duży wieczorny pobór nie wymuszał grzania pełną mocą po najdroższej cenie; 45 = wyłączone, powyżej 50 °C wymaga zaworu mieszającego. Magazyn ciepła podnosi temperaturę zasobnika w najtańszej godzinie — **włącz tylko, jeśli masz zawór mieszający** (ryzyko poparzenia)."
-      }
-     ]
-    },
-    {
-     "type": "grid",
-     "cards": [
-      {
-       "type": "heading",
-       "heading": "Pstryk — ceny energii",
-       "heading_style": "title",
-       "icon": "mdi:cash-clock"
-      },
-      {
-       "type": "entities",
-       "entities": [
-        {
-         "entity": "input_text.kospel_pstryk_api_key",
-         "name": "Klucz API (pstryk.pl)"
-        },
-        {
-         "entity": "sensor.kospel_cena_zakupu_teraz",
-         "name": "Cena teraz (test działania)"
-        }
-       ]
-      },
-      {
-       "type": "markdown",
-       "content": "Klucz z portalu pstryk.pl → Integracje → API. To pole to nadpisanie działające od ręki; docelowo klucz trzymaj w `secrets.yaml` AppDaemona (`pstryk_api_key`, patrz apps.yaml). Kolejność: to pole → apps.yaml → plik `.pstryk-key`."
-      }
-     ]
-    },
-    {
-     "type": "grid",
-     "cards": [
-      {
-       "type": "heading",
-       "heading": "Guardraile autonomii",
-       "heading_style": "title",
-       "icon": "mdi:shield-check"
-      },
-      {
-       "type": "entities",
-       "entities": [
-        {
-         "entity": "input_number.kospel_ai_min_pokoj",
-         "name": "Minimalna temp. pokojowa"
-        },
-        {
-         "entity": "input_number.kospel_okna_prog",
-         "name": "Próg otwartych okien (wietrzenie)"
-        },
-        {
-         "entity": "input_boolean.kospel_wietrzenie_auto",
-         "name": "Automatyka wietrzenia"
-        },
-        {
-         "entity": "input_boolean.kospel_ai_moc_auto",
-         "name": "Limit mocy wg cen (12/20/24 kW)"
-        }
-       ]
-      }
-     ]
-    },
-    {
-     "type": "grid",
-     "cards": [
-      {
-       "type": "heading",
-       "heading": "Z-Wave — kontrolery (Pi)",
-       "heading_style": "title",
-       "icon": "mdi:z-wave"
-      },
-      {
-       "type": "entities",
-       "entities": [
-        {
-         "entity": "sensor.zwave_home_health",
-         "name": "Dom — kontener zdrowy"
-        },
-        {
-         "entity": "sensor.zwave_garage_health",
-         "name": "Garaż — kontener zdrowy"
-        },
-        {
-         "entity": "sensor.kc868_heater_trv_najzimniejszy_pokoj_esp",
-         "name": "TRV → ESP (świeżość danych)"
-        }
-       ]
-      },
-      {
-       "type": "horizontal-stack",
-       "cards": [
-        {
-         "type": "button",
-         "name": "Restart DOM",
-         "icon": "mdi:restart",
-         "tap_action": {
-          "action": "call-service",
-          "service": "rest_command.zwave_restart_home",
-          "confirmation": {
-           "text": "Zrestartować kontener zwave-js (dom)?"
-          }
-         }
-        },
-        {
-         "type": "button",
-         "name": "Restart GARAŻ",
-         "icon": "mdi:restart",
-         "tap_action": {
-          "action": "call-service",
-          "service": "rest_command.zwave_restart_garage",
-          "confirmation": {
-           "text": "Zrestartować kontener zwave-js (garaż)?"
-          }
-         }
-        }
-       ]
-      },
-      {
-       "type": "horizontal-stack",
-       "cards": [
-        {
-         "type": "button",
-         "name": "Update DOM",
-         "icon": "mdi:update",
-         "tap_action": {
-          "action": "call-service",
-          "service": "rest_command.zwave_update_home",
-          "confirmation": {
-           "text": "Zaktualizować obraz zwave-js (dom)? Rollback-safe."
-          }
-         }
-        },
-        {
-         "type": "button",
-         "name": "Update GARAŻ",
-         "icon": "mdi:update",
-         "tap_action": {
-          "action": "call-service",
-          "service": "rest_command.zwave_update_garage",
-          "confirmation": {
-           "text": "Zaktualizować obraz zwave-js (garaż)? Rollback-safe."
-          }
-         }
-        }
-       ]
-      },
-      {
-       "type": "markdown",
-       "content": "Kontrolery aktualizują się same (niedziela 04:00) i restartują po awarii — te przyciski są do ręcznej interwencji."
-      }
-     ]
+      ]
     }
-   ]
-  }
- ]
+  ]
 }

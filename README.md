@@ -115,6 +115,11 @@ Enable packages in `configuration.yaml`, then copy from `homeassistant/packages/
   meters. Point the Energy Dashboard at `sensor.kospel_energia_co/cwu` with your hourly price
   entity. Totals live in long-term statistics → season billing = end minus start.
 
+`homeassistant/automations/` (paste each into a new automation in YAML mode) — power/price and
+critical-alarm pushes, antifreeze override, heating-curve sync boiler ↔ C.MG3, airing resume, TRV
+battery/stale-alarm/setpoint schedule. `homeassistant/scripts/` holds the *za zimno / za ciepło /
+reset* curve buttons the dashboards call. Replace `notify.mobile_app_luke_iphone` with your phone.
+
 `homeassistant/dashboards/wall_panel.json` is a ready wall-panel view (paste into a dashboard
 via raw editor; fits 1080p landscape tablets without scrolling). It references two aggregate
 sensors from the optional TRV setup (`sensor.dom_otwarte_okna`, `sensor.dom_temperatura_min`) —
@@ -174,11 +179,18 @@ All values little-endian **on the wire** (byte-swapped vs Modbus convention). Sl
 | Setpoints (DHW eco/comfort, room, CO max/manual, curves) | `0x0B62…0x0B8D` |
 | Daily programs (5 slots × start/stop/level) | CO base `0x0C1C`, CWU `0x0C9E`, circulation `0x0D20`, C.MG3 `0x0B90`; program *N* = base + 15·(N−1) |
 | Weekly assignments (Mon..Sun) | CO `0x0C94-0x0C9A`, CWU `0x0D16-0x0D1C`, circ `0x0D98-0x0D9E`, C.MG3 `0x0C08-0x0C0E` |
-| RTC | `0x0AF6` (7 regs), written hourly from SNTP |
-| Keep-alive | write `{0x0000, 0x0100}` to `0x0BAE` every 10 s (C.MI heartbeat) |
+| Clock | **broadcast**, address `0x00`, function `0x01`, every 60 s: `00 01 08 YY MM DD WD hh mm ss 00` + CRC (YY = year−2000, WD 0 = Monday). Sets the heater's and the C.MG3's clocks. Read-back: `0x0AF6…0x0AFC` (s, min, h, dow, day, month, year). **A direct write to `0x0AF6` is rejected with exception 2** — the C.MI never does it |
+| Heat-request relay | write 2 words to `0x0BAE` every ~10 s: idle `[0, 1]`; C.MG3 asking for heat `[T×10, 3]`, T = module setpoint + 5 K |
+| Heater state → C.MG3 | **broadcast**, address `0x00`, function `0x02`, 18 words every ~10 s — the module's only source of the boiler's room/outside temperature, room levels and mode |
+| Identification | function `0x11` (Report Slave ID): heater answers `13 FF 00 01 32 01 14 01` → `01 32` = MSK 1.50, `01 14` = PW 1.20 (this is how the C.MI shows the program versions) |
 
 Some config registers only latch when the config word (`0x0B55`/`0x0B54`) is re-written in the
 same burst — the generator handles these "gated" writes.
+
+The two broadcasts are part of the bus master's job (the C.MI sends them, so the ESP must too).
+ESPHome's modbus hub refuses frames to address 0, so the firmware writes them straight to the UART
+(CRC appended) in an idle gap between polls, with the hub's `turnaround_time` cut to 50 ms.
+Tested against MSK 1.50 / PW 1.20 at 9600 8N1.
 
 ## Config flags & season
 
@@ -188,6 +200,14 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 
 ## Lessons learned (the expensive ones)
 
+- **The C.MI never writes the heater's clock register — it broadcasts the time.** Our first
+  release wrote the RTC block at `0x0AF6` hourly; the boiler rejects that with exception 2, and the
+  clock only looked right because the boiler's own clock was already correct. Sniff the original master for a while before
+  you trust a register map: it also broadcasts the heater state to the C.MG3 every 10 s and relays
+  the module's heat request — duties you inherit when you replace it.
+- **ESPHome's modbus hub won't send broadcasts** ("a broadcast (address 0) is never answered") and its
+  default 600 ms `turnaround_time` kept it busy ~85 % of the time. Write broadcast frames to the UART
+  yourself when `tx_blocked()` is false, and drop the turnaround to 50 ms.
 - **ESPHome `http_request` polling can reset your API connection.** Periodic 0.5 s
   `unavailable` blips in HA quantized *exactly* to the poll period (proved by switching the
   interval to a prime 127 s). Fix: invert to UDP push. If you see dotted graphs, suspect any
@@ -231,6 +251,30 @@ procedure — see **[docs/CONFIG-FLAGS.md](docs/CONFIG-FLAGS.md)**.
 - **The LLM's audit is a second opinion, not the last word.** In hybrid mode it flagged real issues
   but also contradicted itself ("too many comfort blocks", then added one). The deterministic rules
   are the final gate for every author.
+
+## Changelog
+
+**v2.5 (2026-11-18)**
+- **Clock fixed:** the time is now sent as the C.MI does it — a once-a-minute broadcast (function `0x01`)
+  — instead of writing `0x0AF6`, which MSK 1.50 / PW 1.20 rejects with exception 2.
+- **ESP takes over the C.MI's full bus role:** heat-request relay for the C.MG3 (`0x0BAE`), heater-state
+  broadcast (function `0x02`) that keeps the module's mirror of the boiler current, raw-UART broadcast
+  transport, hub turnaround 50 ms (on-demand read latency ~26 s → <1 s).
+- Robust airing failsafe (persisted flag, leaves on a stale TRV feed / cold room / after 2 h), power-cap
+  hysteresis, fresh read-modify-write for season changes.
+- **AI:** the plan never depends on the LLM; the house is seen through the TRVs (deficit vs setpoints,
+  24 h history); boiler room setpoints follow the TRVs (Komfort+ = highest TRV setpoint); cold-room
+  guard (any TRV room at/below a threshold forces CO Komfort+); free-text dialogue with the assistant;
+  optional closed-loop comfort trim on the C.MG3 weather curve; savings/backtest survive an HA restart.
+- **Engine:** never loses a DHW charge to slot compression; trust-gated coasting; the hybrid audit overlays
+  CO amendments instead of replacing the plan.
+- **Home Assistant:** new automations (antifreeze, curve sync, airing resume, TRV schedule, TRV stale
+  alarms), curve scripts, four new helpers; CO power debounced so DHW transitions don't count as CO.
+- **Z-Wave:** the agent reads the right FGT-001 status bits and the live battery; the self-heal
+  automations use the REST reply as already-parsed JSON (the `from_json` filter broke the weekly update).
+
+**v2.4 (2026-09-25)** — AI steers the C.MG3 circuit controller; HTTPS + optional API key for the LLM
+endpoint; season steering (v2.3).
 
 ## Roadmap
 

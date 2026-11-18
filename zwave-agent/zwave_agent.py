@@ -25,7 +25,7 @@ COMPOSE_DIR = os.environ.get("ZW_COMPOSE_DIR", "")   # if set -> manage via dock
 WS = os.environ.get("ZW_WS", "ws://127.0.0.1:3000")
 # UDP push target for the Kospel ESP (the ESP's HTTP pull was killing its HA API connection).
 # Empty/unset -> no push (garage Pi has no TRVs anyway).
-ESP_UDP = os.environ.get("ZW_ESP_UDP", "192.168.1.221:8902")
+ESP_UDP = os.environ.get("ZW_ESP_UDP", "192.168.1.221:8902")   # EDIT ME (or set ZW_ESP_UDP): your ESP IP:port
 # fixed run args (identical on both Pis)
 RUN_ARGS = ["--name", CONTAINER, "--restart", "always",
             "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
@@ -68,9 +68,14 @@ async def poll_once():
                                      v.get("propertyKey"), v.get("endpoint"), v.get("value"))
                 if cc == 49 and p == "Air temperature": r["temp"] = val
                 elif cc == 67 and p == "setpoint": r["cel"] = val
-                elif cc == 128 and ep == 0: r["bateria"] = val
-                elif cc == 112 and p == 3 and k == 1: r["okno"] = int(val or 0)
-                elif cc == 112 and p == 3 and k == 2: r["grzeje"] = int(val or 0)
+                # FGT-001 battery: endpoint 0 is a stale root copy; endpoints 1/2 are live -> take the lower
+                elif cc == 128 and ep in (1, 2) and p == "level" and isinstance(val, (int, float)):
+                    r["bateria"] = val if r["bateria"] is None else min(r["bateria"], val)
+                # Configuration param 3 (read-only status bitmask), Z-Wave JS partial keys: 1 = external
+                # temperature sensor, 2 = Open Window Detected, 4 = Provide Heat, 8 = Malfunctioning Heating
+                # System. Until 2026-10-17 this read key 1 as 'okno' and key 2 as 'grzeje' (both wrong).
+                elif cc == 112 and p == 3 and k == 2: r["okno"] = int(val or 0)
+                elif cc == 112 and p == 3 and k == 4: r["grzeje"] = int(val or 0)
             rooms[nm] = r
         temps = [r["temp"] for r in rooms.values() if isinstance(r["temp"], (int, float))]
         STATE.update({"ts": int(time.time()), "rooms": rooms,

@@ -7,6 +7,21 @@
 # or the monthly utility_meter values.
 
 template:
+  - binary_sensor:
+      # Debounced "CO is really heating" flag. At the start/end of a DHW charge the power reading
+      # jumps before dhw_demand flips, so for a single ~20 s sample "power>0 and not dhw" is true
+      # even though it is really CWU — that misattributed CO ~12 kW spikes to zero-duration CO runs
+      # (found 2026-09-29: moc_co showed 12 kW blips but energia_co barely moved). delay_on requires
+      # the condition to hold continuously before CO counts, which absorbs those transition glitches.
+      - name: "Kospel CO aktywne"
+        unique_id: kospel_co_aktywne
+        availability: >
+          {{ states('sensor.kc868_heater_heater_power_now') not in ['unknown','unavailable'] }}
+        state: >
+          {{ states('sensor.kc868_heater_heater_power_now') | float(0) > 0
+             and not is_state('binary_sensor.kc868_heater_heater_dhw_demand', 'on') }}
+        delay_on:
+          seconds: 45
   - sensor:
       - name: "Kospel moc CO"
         unique_id: kospel_moc_co
@@ -18,9 +33,10 @@ template:
         # CO = everything the boiler burns that is NOT charging the DHW tank. The boiler's own co_demand
         # flag cannot be used: with an external room regulator / C.MG3 ("Źródło ciepła") it never asserts,
         # so CO energy read 0 while real heating kWh went uncounted (found 2026-09-25).
+        # Gated on the debounced kospel_co_aktywne so DHW-transition glitches do not count (2026-09-29).
         state: >
           {% set p = states('sensor.kc868_heater_heater_power_now') | float(0) %}
-          {{ p if not is_state('binary_sensor.kc868_heater_heater_dhw_demand', 'on') else 0 }}
+          {{ p if is_state('binary_sensor.kospel_co_aktywne', 'on') else 0 }}
       - name: "Kospel moc CWU"
         unique_id: kospel_moc_cwu
         unit_of_measurement: "kW"

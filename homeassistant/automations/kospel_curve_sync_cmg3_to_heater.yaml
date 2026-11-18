@@ -1,0 +1,41 @@
+# Shared heating circuit: the boiler curve number and shift follow the C.MG3 (counterpart of the automation above).
+alias: 'Kospel: krzywa C.MG3 -> kocioł'
+description: 'Wspólny obieg: numer krzywej i przesunięcie kotła podążają za C.MG3. Porównuje odczyty rejestrów (_read):
+  encje number pokazują przez ~5 s po starcie ESP wartość minimalną (2026-10-07: krzywa 18 kotła nadpisała 14 modułu
+  przy ponownym połączeniu). Zmiana 2026-10-17.'
+triggers:
+- trigger: state
+  entity_id:
+  - sensor.kc868_heater_c_mg3_heating_curve_number_read
+  - sensor.kc868_heater_c_mg3_heating_curve_shift_read
+  not_from:
+  - unknown
+  - unavailable
+  not_to:
+  - unknown
+  - unavailable
+actions:
+- if:
+  - condition: template
+    value_template: '{{ has_value(''sensor.kc868_heater_c_mg3_heating_curve_number_read'') and has_value(''sensor.kc868_heater_heater_co_heating_curve_number_read'')
+      and (states(''sensor.kc868_heater_c_mg3_heating_curve_number_read'')|float(0))|round(0) != (states(''sensor.kc868_heater_heater_co_heating_curve_number_read'')|float(0))|round(0)
+      }}'
+  then:
+  - action: number.set_value
+    target:
+      entity_id: number.kc868_heater_heater_co_heating_curve_number
+    data:
+      value: '{{ (states(''sensor.kc868_heater_c_mg3_heating_curve_number_read'')|float)|round(0)|int }}'
+- if:
+  - condition: template
+    value_template: '{{ has_value(''sensor.kc868_heater_c_mg3_heating_curve_shift_read'') and has_value(''sensor.kc868_heater_heater_co_curve_offset_read'')
+      and (states(''sensor.kc868_heater_c_mg3_heating_curve_shift_read'')|float(0))|round(0) != (states(''sensor.kc868_heater_heater_co_curve_offset_read'')|float(0))|round(0)
+      }}'
+  then:
+  - action: number.set_value
+    target:
+      entity_id: number.kc868_heater_heater_co_curve_offset
+    data:
+      value: '{{ ([ -10, [ 10, (states(''sensor.kc868_heater_c_mg3_heating_curve_shift_read'')|float(0))|round(0)|int
+        ]|min ]|max) }}'
+mode: queued
