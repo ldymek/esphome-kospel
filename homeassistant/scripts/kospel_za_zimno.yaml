@@ -1,0 +1,36 @@
+# Dashboard button "too cold": raise the boiler heating-curve offset by 1 (max +10), retrying until the
+# register read-back confirms it; the C.MG3 shift follows via the curve-sync automations.
+alias: 'Kospel: za zimno (krzywa +1)'
+icon: mdi:snowflake-thermometer
+mode: restart
+sequence:
+- variables:
+    target: '{{ ([ (states(''sensor.kc868_heater_heater_co_curve_offset_read'')|float(0)) + 1, 10 ]|min)|round(1)
+      }}'
+- repeat:
+    while:
+    - condition: template
+      value_template: '{{ (states(''sensor.kc868_heater_heater_co_curve_offset_read'')|float(-99))|round(1) != (target|float)|round(1)
+        }}'
+    - condition: template
+      value_template: '{{ repeat.index <= 4 }}'
+    sequence:
+    - target:
+        entity_id: number.kc868_heater_heater_co_curve_offset
+      data:
+        value: '{{ target }}'
+      action: number.set_value
+    - delay:
+        seconds: 14
+- variables:
+    final: '{{ states(''sensor.kc868_heater_heater_co_curve_offset_read'')|float(0) }}'
+- data:
+    notification_id: kospel_komfort
+    title: 'Ogrzewanie: cieplej (krzywa +1 °C)'
+    message: '{% if (final|float)|round(1) == (target|float)|round(1) %}Przesunięcie krzywej grzania = {{ final|round(0)|int
+      }} °C. Podniesiono krzywą grzania — cieplej, ale koszt ogrzewania wzrośnie.{% else %}Kocioł zajęty (dezynfekcja/Turbo)
+      — zmiana nie weszła. Naciśnij ponownie za chwilę.{% endif %}
+
+
+      (Działa w trybie sterowania krzywą; w trybie ręcznym kocioł trzyma nastawę ręczną.)'
+  action: persistent_notification.create

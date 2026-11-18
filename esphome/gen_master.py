@@ -137,7 +137,7 @@ wifi:
   # Static IP (no DHCP dependency; .221-.223 = the three ESPHome nodes). The MikroTik still
   # holds a stale .134 reservation for this MAC — harmless, device never DHCPs.
   manual_ip:
-    static_ip: 192.168.1.221
+    static_ip: 192.168.1.221   # EDIT ME: the ESP static IP, gateway and DNS (next lines)
     gateway: 192.168.1.1
     subnet: 255.255.255.0
     dns1: 192.168.1.1
@@ -145,23 +145,15 @@ wifi:
     ssid: "${name}-fallback"
     password: !secret fallback_ap_password
 captive_portal:
-# NTP time -> heater RTC. The C.MI kept the heater clock synced (needed for schedules/disinfection);
-# the ESP now does it. Heater RTC lives at 0x0AF6..0x0AFC = sec,min,hour,dow(0=Mon),day,month,year-2000
-# (little-endian, func16). Europe/Warsaw gives DST-correct local time -> keep heater auto-DST OFF.
+# NTP time: drives the power-plan executor and the fc 0x01 CLOCK BROADCAST (interval below), which is
+# what sets the heater's and the C.MG3's RTCs — the C.MI never writes the heater RTC 0x0AF6 directly and
+# a direct fc16 write there is rejected with exception 2 (removed 2026-10-17). Europe/Warsaw gives
+# DST-correct local time -> keep heater auto-DST OFF.
 time:
   - platform: sntp
     id: sntp_time
     timezone: Europe/Warsaw
     servers: [pool.ntp.org, time.google.com]
-    on_time_sync:
-      - lambda: |-
-          if(!id(esp_owns_bus)) return;
-          auto t=id(sntp_time).now(); if(!t.is_valid()) return;
-          auto sw=[](uint16_t v){return (uint16_t)(((v&0xFF)<<8)|(v>>8));};
-          uint16_t dow=(uint16_t)(((int)t.day_of_week+5)%7);
-          std::vector<uint16_t> w={sw((uint16_t)t.second),sw((uint16_t)t.minute),sw((uint16_t)t.hour),sw(dow),sw((uint16_t)t.day_of_month),sw((uint16_t)t.month),sw((uint16_t)(t.year-2000))};
-          id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(id(heater),0x0AF6,7,w));
-          ESP_LOGI("timesync","heater clock <- %04d-%02d-%02d %02d:%02d:%02d dow%d",t.year,t.month,t.day_of_month,t.hour,t.minute,t.second,(int)dow);
 # Onboard I2C expanders: relays @0x24 (also inputs @0x22, RTC 0x68, OLED 0x3C present).
 i2c:
   sda: GPIO4
@@ -222,10 +214,22 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: trv_lato_flag
+  - id: trv_lato_flag          # persisted: a reboot mid-airing must not strand the boiler in Lato
     type: bool
-    restore_value: no
+    restore_value: yes
     initial_value: 'false'
+  - id: trv_lato_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: trv_block_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: trv_ha_down_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   - id: trv_okna_since
     type: uint32_t
     restore_value: no
@@ -262,6 +266,10 @@ modbus:
   id: modbus_bus
   uart_id: rs485
   send_wait_time: 1000ms   # was 2000ms default; fail unresponsive reads faster so the queue drains
+  # 600 ms default idle gap after every transaction saturated the hub (~0.65 s per poll, mb_read latency
+  # ~26 s, no idle windows for the raw broadcasts). The C.MI runs ~60 transactions in 9 s, so the devices
+  # are fine with short gaps. (2026-10-08)
+  turnaround_time: 50ms
 # Auto-polling (stable). The bus-owner switch pauses/resumes these via stop_poller()/start_poller()
 # so the ESP goes fully silent when the C.MI takes the bus (no manual-update queue pileups).
 modbus_controller:
@@ -296,6 +304,9 @@ MON = [
  # Heater RTC readback (to see the NTP-synced clock). 0x0AF7 min, 0x0AF8 hour.
  (0x0AF8,"heater_rtc_hour","Heater RTC hour",1,False,None,None),
  (0x0AF7,"heater_rtc_min","Heater RTC minute",1,False,None,None),
+ # Active room-temperature level (C.MI heater page: 0 eko, 1 ochrona, 2 komfort, 3 komfort-, 4 komfort+,
+ # 64 ręczny). Relayed to the C.MG3 as mirror 0x0C6F by the state broadcast below (2026-10-07).
+ (0x0B32,"room_index_ro","Heater room setting index",1,False,None,None),
 ]
 RAWDIAG = [(0x0B55,"mode_word","Heater mode word"),(0x0B52,"error_code","Heater error code"),
            (0x0B51,"status_word","Heater status word"),
@@ -322,19 +333,21 @@ CONTROLS = [
  ("heater",0x0B7B,"co_temp_max","Heater CO max temp",20,85,0.5,10,"°C"),
  ("heater",0x0B73,"co_temp_manual","Heater CO manual temp",20,85,0.5,10,"°C"),
  ("heater",0x0B74,"co_temp_outside_off","Heater CO outside-off temp",0,40,0.5,10,"°C"),
- ("heater",0x0B71,"co_curve_number","Heater CO heating-curve number",0,20,1,1,None),
+ ("heater",0x0B71,"co_curve_number","Heater CO heating-curve number",4,25,1,1,None),   # C.MI UI range 4..25
  # Group B1: service config direct-write values
  ("heater",0x0B59,"pump_protection_time","Heater pump protection time",0,1440,1,1,"min"),
  ("heater",0x0B81,"turbo_hysteresis","Heater turbo hysteresis",0.1,10,0.1,10,"°C"),
- ("heater",0x0B72,"co_curve_offset","Heater CO curve offset",-10,10,0.5,10,"°C"),
+ ("heater",0x0B72,"co_curve_offset","Heater CO curve offset",-10,10,1,1,"°C"),   # whole degrees (C.MI wrote 0 for 0; same convention as the C.MG3 shift)
  # Disinfection schedule params (plain writes; day+start read-only above). Flags on 0x0B54 -> switches.
  ("heater",0x0B76,"disinfection_temp","Dezynfekcja temp. docelowa",40,75,0.5,10,"°C"),
  ("heater",0x0B79,"disinfection_duration","Dezynfekcja czas trwania",5,180,5,1,"min"),
  # C.MG3 (0x69) — writable via ESP (auto-poll). curve_number/max_supply/hand_temp hold as plain
  # single writes. curve_shift (0x0B61) latches ONLY when bundled with curve_number+flag -> handled
  # by CMG3_CURVE_BUNDLE below, not here. C.MG3 rejects wide reads -> reuse_previous_range: false on EVERY C.MG3 entity (each register isolated).
- ("cmg3",0x0B60,"cmg3_curve_number","C.MG3 heating curve number",0,20,1,1,None),
- ("cmg3",0x0B61,"cmg3_curve_shift","C.MG3 heating curve shift",-5,5,0.5,10,"°C"),
+ ("cmg3",0x0B60,"cmg3_curve_number","C.MG3 heating curve number",4,20,1,1,None),   # range 0x0B02/0x0B03 = 4..20
+ # shift is WHOLE degrees on the wire (C.MI UI shows the raw register; manual: curve 12 ±10 °C).
+ # scale 10 here sent +5.0 as 50 = a 50 °C shift (2026-10-06 bug).
+ ("cmg3",0x0B61,"cmg3_curve_shift","C.MG3 heating curve shift",-10,10,1,1,"°C"),   # whole °C; range from 0x0B04/0x0B05 (-100/100 ÷10 = ±10) per local app
  ("cmg3",0x0B57,"cmg3_max_supply","C.MG3 max circuit supply",20,80,0.5,10,"°C"),
  ("cmg3",0x0B5B,"cmg3_hand_temp","C.MG3 hand temperature",5,35,0.5,10,"°C"),
  ("cmg3",0x0B5C,"cmg3_pump_protect","C.MG3 czas ochrony pompy",0,1440,1,1,"min"),
@@ -380,7 +393,11 @@ SELECTS = [
  # Max power as user-facing kW (index 0..3 -> table 0x0B36.. = 120/160/200/240 => 12/16/20/24 kW).
  ("heater",0x0B62,"max_power_kw","Moc maksymalna",["12 kW","16 kW","20 kW","24 kW"]),
  # C.MG3 schedule type: 0x0B5F plain (0=outside/pogodowy, 1=inside/pokojowy).
- ("cmg3",0x0B5F,"cmg3_timetable_type","C.MG3 typ harmonogramu",["Pogodowy (zewn.)","Pokojowy (wewn.)"]),
+ # 0 = harmonogram ZEWNĘTRZNY (module follows the boiler's programme relayed by the bus master),
+ # 1 = harmonogram WEWNĘTRZNY (module runs its own weekly programme and requests heat itself).
+ # Our AI writes the module's programme, so 1 is the working setting. 0 left the module at its
+ # anti-freeze level for weeks (2026-10-04..06). These are NOT weather/room modes.
+ ("cmg3",0x0B5F,"cmg3_timetable_type","C.MG3 typ harmonogramu",["Zewnętrzny (program kotła)","Wewnętrzny (program C.MG3)"]),
  # Heater system topology (config_mode__save writes 0x0B8A plain): 0=basic,1=source,2=buffer.
  ("heater",0x0B8A,"operating_mode","Tryb pracy (system)",["Podstawowy","Źródło ciepła","Bufor"]),
 ]
@@ -452,7 +469,8 @@ id(cfg_circulation_ctl).publish_state(((c>>2)&1)!=0);
 id(cfg_pressure_ctl).publish_state(((c>>8)&1)!=0);
 id(cfg_dis_circ_ctl).publish_state(((c>>5)&1)!=0);
 id(cfg_dis_now_ctl).publish_state(((c>>6)&1)!=0);
-id(cfg_dis_auto_ctl).publish_state(((c>>7)&1)!=0);''',
+id(cfg_dis_auto_ctl).publish_state(((c>>7)&1)!=0);
+id(cfg_pump_venting_ctl).publish_state(((c>>13)&1)!=0);''',
  "error_code":'''uint16_t e=(uint16_t)x;
 if(e==0){ id(error_text).publish_state("OK"); return; }
 const char* n[]={"EEPROM","czujnik T wej.","czujnik T wyj.","czujnik T zasobnika","czujnik T wewn.","czujnik T zewn.","czujnik T pokojowej","słaba bateria","ciśnienie","pompa CO","zawór CO","zawór CWU"};
@@ -505,7 +523,7 @@ def wp_pub(ent, nv_expr, pub_stmt):
     i = WPIDX[ent]; eps = WP_EPS[ent]
     return (f"{{ float nv=({nv_expr}); if(id(wp_until)[{i}]!=0){{ "
             f"if(fabsf(nv-id(wp_target)[{i}])<={eps:g}f){{ id(wp_until)[{i}]=0; {pub_stmt} }} "
-            f"else if(millis()>id(wp_until)[{i}]){{ id(wp_until)[{i}]=0; id(wp_failed)[{i}]=millis(); {pub_stmt} }} "
+            f"else if((int32_t)(millis()-id(wp_until)[{i}])>0){{ id(wp_until)[{i}]=0; id(wp_failed)[{i}]=millis(); {pub_stmt} }} "
             f"}} else {{ {pub_stmt} }} }}")
 
 # GATED numbers: value only persists if the gate register is (re)written in the same burst.
@@ -610,6 +628,8 @@ CONFIG_FLAGS=[
   ("cfg_dis_circ","Dezynfekcja z cyrkulacją",5,0x0B54,"mdi:pump-outline"),
   ("cfg_dis_now","Dezynfekcja — uruchom teraz",6,0x0B54,"mdi:play"),
   ("cfg_dis_auto","Dezynfekcja automatyczna",7,0x0B54,"mdi:calendar-clock"),
+  # captured 2026-10-06: C.MI pump page sets 0x0B54 bit13; boiler runs the 10-min purge and clears it.
+  ("cfg_pump_venting","Pompa — odpowietrzanie teraz (10 min)",13,0x0B54,"mdi:air-filter"),
 ]
 def config_flag_switch(idn,name,bit,reg,icon):
     return f'''  - platform: template
@@ -625,10 +645,12 @@ def config_flag_switch(idn,name,bit,reg,icon):
       {bit_rmw(False,bit,reg,arm=wp_arm(idn+"_ctl","0.0f"))}'''
 
 # C.MG3 config-word switches (device 0x69, 0x0B54 — SEPARATE from the heater's 0x0B54). Plain RMW
-# (no echo/gate). bit1 regulation (0=ręcznie,1=krzywa), bit4 hand, bit5 pump auto. From the local app.
+# (no echo/gate). bit1 regulation (0=ręcznie,1=krzywa), bit5 pump auto. From the local app
+# (local-cmg-69.html): **bit4 = _circuit_hangup = "zawieszenie pracy modułu"** (suspend), NOT a hand
+# mode — it was mislabeled "tryb ręczny" until 2026-10-07 (manual regulation = bit1 OFF + hand temp 0x0B5B).
 CMG3_FLAGS=[
   ("cmg3_regulation","C.MG3 — regulacja wg krzywej",1,"mdi:chart-bell-curve"),
-  ("cmg3_hand","C.MG3 — tryb ręczny",4,"mdi:hand-back-right"),
+  ("cmg3_hangup","C.MG3 — zawieszenie pracy modułu",4,"mdi:pause-circle"),
   ("cmg3_pump_auto","C.MG3 — pompa AUTO",5,"mdi:pump"),
 ]
 def cmg3_flag_switch(idn,name,bit,icon):
@@ -734,6 +756,18 @@ BUS_SWITCH='''  - platform: gpio
           id(cmg3)->start_poller();
       - logger.log: "Bus reclaimed by ESP master."'''
 
+# Handover: the ESP stops polling, so HA would keep showing the last values as if live ("fake data",
+# 2026-10-06). Invalidate every live reading when the C.MI takes the bus; the pollers refresh them on
+# reclaim. (Controls/setpoints keep their last known value — they are not measurements.)
+_NAN_ALL = " ".join(f"id({r[1]}).publish_state(NAN);" for r in MON) + " " + \
+           " ".join(f"id({r[1]}).publish_state(NAN);" for r in RAWDIAG) + \
+           " id(cmg3_circuit_setpoint).publish_state(NAN); id(cmg3_circuit_temp).publish_state(NAN);" \
+           " id(cmg3_pump_word).publish_state(NAN); id(cmg3_error_word).publish_state(NAN);" \
+           " id(cmg3_status_word).publish_state(NAN); id(cmg3_operating_mode_raw).publish_state(NAN);"
+BUS_SWITCH = BUS_SWITCH.replace("          id(cmg3)->stop_poller();",
+    "          id(cmg3)->stop_poller();\n          " + _NAN_ALL + "\n"
+    "          ESP_LOGW(\"bus\", \"Bus -> C.MI: live readings invalidated until reclaim\");", 1)
+
 # ---- register every writable control in the pending framework (indices used by guards below) ----
 for dev,reg,idn,name,vmin,vmax,step,scale,unit in CONTROLS: wp_reg(idn+"_set", name, step/2+0.011)
 for idn,name,vreg,vmin,vmax,step,scale,unit,greg in GATED: wp_reg(idn+"_set", name, step/2+0.011)
@@ -796,6 +830,65 @@ for reg,idn,name in RAWDIAG:
       {swap_uint()}"""
     if idn in TEXTHOOKS: s+=onval_block(TEXTHOOKS[idn])
     out.append(s)
+# C.MG3 circuit setpoint (CIRCUIT_FACTOR_SETTING, °C x10): the module's own decision. 20.0 = idle
+# floor (no heat needed), 57.0 observed when heating. Drives the heat-request relay to the boiler.
+out.append(f"""  - platform: modbus_controller
+    modbus_controller_id: cmg3
+    id: cmg3_circuit_setpoint
+    name: "C.MG3 nastawa obiegu"
+    register_type: holding
+    address: 0x0B45
+    value_type: U_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    reuse_previous_range: false
+    filters:
+      {swap_signed(0.1, False)}""")
+# C.MG3 live status (from the local low-level app, 2026-10-07): circuit temp 0x0B46 (0 = circuit not
+# running), pump 0x0B4C b0, sensor error 0x0B50 b0, status 0x0B52 (b1 RP input, b2 heating-off,
+# b3 alert = setpoint not reached, b5 turbo), operating mode 0x0B56 (1 = roboczy), and the module's
+# live copy of the heater's outside temp 0x0C68. Binary sensors derived below.
+out.append(f"""  - platform: modbus_controller
+    modbus_controller_id: cmg3
+    id: cmg3_circuit_temp
+    name: "C.MG3 temp. obiegu"
+    register_type: holding
+    address: 0x0B46
+    value_type: U_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    reuse_previous_range: false
+    filters:
+      {swap_signed(0.1, False)}
+  - platform: modbus_controller
+    modbus_controller_id: cmg3
+    id: cmg3_source_outside
+    name: "C.MG3 temp. zewn. (kopia ze źródła)"
+    register_type: holding
+    address: 0x0C68
+    value_type: U_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    entity_category: diagnostic
+    reuse_previous_range: false
+    filters:
+      {swap_signed(0.1, True)}
+      - filter_out: nan""")
+for reg,idn,name in [(0x0B4C,"cmg3_pump_word","C.MG3 słowo pompy"),(0x0B50,"cmg3_error_word","C.MG3 słowo błędów"),
+                     (0x0B52,"cmg3_status_word","C.MG3 słowo stanu"),(0x0B56,"cmg3_operating_mode_raw","C.MG3 tryb pracy (raw)")]:
+    out.append(f"""  - platform: modbus_controller
+    modbus_controller_id: cmg3
+    id: {idn}
+    name: "{name}"
+    register_type: holding
+    address: 0x{reg:04X}
+    value_type: U_WORD
+    entity_category: diagnostic
+    reuse_previous_range: false
+    filters:
+      {swap_uint()}""")
 # C.MG3 read-only diagnostic (config/flags word). The writable C.MG3 controls (curve number/
 # shift, max supply, hand temp, regulation) are generated from CONTROLS/SELECTS below.
 out.append(f"""  - platform: modbus_controller
@@ -813,7 +906,7 @@ out.append(f"""  - platform: modbus_controller
       - lambda: |-
           uint16_t c=(uint16_t)x;
           {wp_pub("cmg3_regulation_ctl","(((c>>1)&1)!=0)?1.0f:0.0f","id(cmg3_regulation_ctl).publish_state(nv>0.5f);")}
-          {wp_pub("cmg3_hand_ctl","(((c>>4)&1)!=0)?1.0f:0.0f","id(cmg3_hand_ctl).publish_state(nv>0.5f);")}
+          {wp_pub("cmg3_hangup_ctl","(((c>>4)&1)!=0)?1.0f:0.0f","id(cmg3_hangup_ctl).publish_state(nv>0.5f);")}
           {wp_pub("cmg3_pump_auto_ctl","(((c>>5)&1)!=0)?1.0f:0.0f","id(cmg3_pump_auto_ctl).publish_state(nv>0.5f);")}""")
 for dev,reg,idn,name,vmin,vmax,step,scale,unit in CONTROLS:
     sc=1.0/scale if scale!=1 else 1.0
@@ -900,6 +993,20 @@ for name,bit in MODE_BITS:
     out.append(f"""  - platform: template
     name: "Heater mode {name}"
     lambda: 'return ((uint16_t) id(mode_word).state) & (1 << {bit});'""")
+# C.MG3 status flags + relay/bus state (2026-10-07).
+for name,expr in [
+    ("C.MG3 pompa pracuje", "((uint16_t) id(cmg3_pump_word).state) & 1"),
+    ("C.MG3 wejście RP (regulator pokojowy)", "((uint16_t) id(cmg3_status_word).state) & (1 << 1)"),
+    ("C.MG3 alarm — nie osiąga nastawy", "((uint16_t) id(cmg3_status_word).state) & (1 << 3)"),
+    ("C.MG3 turbo w toku", "((uint16_t) id(cmg3_status_word).state) & (1 << 5)"),
+    ("C.MG3 błąd czujnika obiegu", "((uint16_t) id(cmg3_error_word).state) & 1"),
+    ("C.MG3 tryb roboczy", "((int) id(cmg3_operating_mode_raw).state) == 1"),
+    ("C.MG3 żąda ciepła", "((uint16_t) id(cmg3_status_word).state) & (1 << 2)"),
+    ("ESP steruje magistralą", "id(esp_owns_bus)"),
+]:
+    out.append(f"""  - platform: template
+    name: "{name}"
+    lambda: 'return {expr};'""")
 # Anti-legionella running indicator: DHW driven well above its normal comfort setpoint (max ~48C)
 # toward the disinfection target (~70C). Derived, no dedicated status bit needed.
 out.append("""  - platform: template
@@ -1009,14 +1116,21 @@ out.append('''  - platform: template
       - lambda: |-
           if(!id(esp_owns_bus)){return;}
           ''' + wp_arm("heater_mode",'(x=="winter")?2.0f:((x=="summer")?1.0f:0.0f)') + '''
-          uint16_t reg=(uint16_t)id(mode_word).state;
-          reg &= ~((1<<3)|(1<<5));
-          if (x=="summer") reg|=(1<<3);
-          if (x=="winter") reg|=(1<<5);
-          uint16_t wire=((reg&0xFF)<<8)|(reg>>8);
-          auto cmd=esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
-              id(heater), 0x0B55, 1, {wire});
-          id(heater)->queue_command(cmd);''')
+          bool to_s=(x=="summer"), to_w=(x=="winter");
+          // FRESH read-modify-write: never build the word from the cached mode_word (stale / NaN at boot)
+          auto rd=esphome::modbus_controller::ModbusCommandItem::create_read_command(
+              id(heater), esphome::modbus_controller::ModbusRegisterType::HOLDING, 0x0B55, 1,
+              [to_s,to_w](esphome::modbus::EntityType, uint16_t, std::span<const uint8_t> d){
+                if(d.size()<2) return;
+                uint16_t reg=(uint16_t)((d[1]<<8)|d[0]);
+                reg &= ~((1<<3)|(1<<5));
+                if(to_s) reg|=(1<<3);
+                if(to_w) reg|=(1<<5);
+                uint16_t wire=((reg&0xFF)<<8)|(reg>>8);
+                id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+                    id(heater), 0x0B55, 1, {wire}));
+              });
+          id(heater)->queue_command(rd);''')
 # Schedule editor: timetable selector + 5 slot temperature-level selects.
 out.append('''  - platform: template
     name: "Edytor: harmonogram"
@@ -1103,6 +1217,19 @@ out.append('''button:
           id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
               id(heater), 0x0B53, 1, {wire}));
           ESP_LOGW("restart", "FLAG_RESET_MSK -> 0x0B53=1 (soft heater reboot)");
+  # C.MG3 module restart — C.MI "restart modułu grzewczego" = single write of 1 to 0x0C12 (captured 2026-10-06).
+  - platform: template
+    name: "Restart modułu C.MG3"
+    id: cmg3_restart_btn
+    icon: mdi:restart
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(esp_owns_bus)) return;
+          uint16_t wire = ((1 & 0xFF) << 8) | (1 >> 8);
+          id(cmg3)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+              id(cmg3), 0x0C12, 1, {wire}));
+          ESP_LOGW("restart", "C.MG3 restart -> 0x0C12=1");
   # On-demand WiFi site survey: blocking all-channel scan (~2 s loop stall, diagnostic use),
   # full list to the log at INFO, compact strongest-first summary into the "Skan WiFi" sensor.
   - platform: template
@@ -1189,24 +1316,29 @@ out.append(f'''  - platform: template
           if(tt==3){{ for(int r=0;r<15;r++) id(cmg3)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(id(cmg3),(uint16_t)(base+r),1,{{regs[r]}})); }}
           else id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(id(heater),base,15,regs));''')
 
-# TRV-bridge poll + HA-independent window failsafe. Data path: zwave-js (RPi) -> trv_bridge
-# (r730-gpu:8901) -> this ESP. Rule mirrors the HA "wietrzenie" automation so it works with HA down:
-# >=2 windows open 3 min in Zima -> Lato (CWU keeps working); all closed 2 min -> restore Zima.
-# Acts only on FRESH data (<10 min) and only reverses what it itself changed (trv_lato_flag).
+# Data path: zwave-js (RPi .80) -> /opt/zwave-agent/zwave_agent.py UDP push (port 8902, 30 s) -> this ESP.
+# TRV failsafe = HA-INDEPENDENT backstop for airing. The primary handling is HA's kospel_wietrzenie_*
+# automations; the ESP enters only while the HA API has been disconnected > 5 min, so the two never race.
+# Enter: >=2 windows open 3 min in Zima -> Lato (CWU keeps working); the flag is persisted across reboots.
+# Leave (flag set, Lato): <2 windows open 2 min, OR the TRV feed is stale (>10 min: it cannot see the
+# windows -> heat rather than guess), OR the coldest room < 16 C, OR > 2 h in failsafe; a forced leave
+# with windows still open blocks re-entry for 1 h. The flag clears only once Zima is READ BACK (a lost
+# write is retried every 30 s) — also when someone else (user / HA / AI) restored Zima.
+# History: until 2026-10-17 the flag was volatile, the exit needed ALL windows closed and stale data held
+# Lato; harmless only because the TRV agent sent the wrong Z-Wave bit (okna always 0).
 out.append('''interval:
   - interval: 30s
     then:
       - lambda: |-
           if (!id(esp_owns_bus)) return;
           uint32_t now = millis();
-          if (id(trv_last_ok) == 0 || now - id(trv_last_ok) > 10UL*60UL*1000UL) return;  // stale data
-          uint16_t m = (uint16_t) id(mode_word).state;
+          bool ha = esphome::api::global_api_server != nullptr && esphome::api::global_api_server->is_connected();
+          if (ha) id(trv_ha_down_since) = 0; else if (id(trv_ha_down_since) == 0) id(trv_ha_down_since) = now;
+          float mw = id(mode_word).state;
+          if (isnan(mw)) return;                                  // no fresh mode word yet (boot / bus handover)
+          uint16_t m = (uint16_t) mw;
           bool winter = (m >> 5) & 1, summer = (m >> 3) & 1;
-          int okna = id(trv_okna);
-          if (okna >= 2 && winter) { if (id(trv_okna_since) == 0) id(trv_okna_since) = now; }
-          else id(trv_okna_since) = 0;
-          if (okna == 0) { if (id(trv_closed_since) == 0) id(trv_closed_since) = now; }
-          else id(trv_closed_since) = 0;
+          bool fresh = id(trv_last_ok) != 0 && now - id(trv_last_ok) <= 10UL*60UL*1000UL;
           auto rmw_season = [](bool to_summer){
             auto rd = esphome::modbus_controller::ModbusCommandItem::create_read_command(
                 id(heater), esphome::modbus_controller::ModbusRegisterType::HOLDING, 0x0B55, 1,
@@ -1221,13 +1353,38 @@ out.append('''interval:
                 });
             id(heater)->queue_command(rd);
           };
-          if (!id(trv_lato_flag) && winter && id(trv_okna_since) != 0 && now - id(trv_okna_since) > 3UL*60UL*1000UL) {
-            rmw_season(true); id(trv_lato_flag) = true;
-            ESP_LOGW("trv", "Failsafe: okna otwarte -> Lato (CO wstrzymane)");
+          if (id(trv_lato_flag)) {
+            if (id(trv_lato_since) == 0) id(trv_lato_since) = now;              // the flag survived a reboot
+            if (winter && now - id(trv_lato_since) > 90UL*1000UL) {             // Zima read back (ours or someone else's)
+              id(trv_lato_flag) = false; id(trv_lato_since) = 0; id(trv_closed_since) = 0;
+              ESP_LOGW("trv", "Failsafe: Zima potwierdzona -> koniec");
+              return;
+            }
+            if (!summer) return;                                                 // mode off / write pending: hands off
+            int okna = fresh ? id(trv_okna) : -1;
+            if (okna >= 0 && okna < 2) { if (id(trv_closed_since) == 0) id(trv_closed_since) = now; }
+            else id(trv_closed_since) = 0;
+            bool closed = id(trv_closed_since) != 0 && now - id(trv_closed_since) > 2UL*60UL*1000UL;
+            bool cold = fresh && !isnan(id(trv_min_temp)) && id(trv_min_temp) < 16.0f;
+            bool too_long = now - id(trv_lato_since) > 2UL*3600UL*1000UL;
+            if (closed || !fresh || cold || too_long) {
+              rmw_season(false);                                                 // retried every 30 s until read back
+              if (!closed) id(trv_block_until) = now + 3600UL*1000UL;
+              static uint32_t last_log = 0;
+              if (last_log == 0 || now - last_log > 300000UL) {
+                last_log = now;
+                ESP_LOGW("trv", "Failsafe: -> Zima (%s)", closed ? "okna zamkniete" : (!fresh ? "brak danych TRV" : (cold ? "zimno w pokoju" : "> 2 h")));
+              }
+            }
+            return;
           }
-          if (id(trv_lato_flag) && summer && id(trv_closed_since) != 0 && now - id(trv_closed_since) > 2UL*60UL*1000UL) {
-            rmw_season(false); id(trv_lato_flag) = false;
-            ESP_LOGW("trv", "Failsafe: okna zamkniete -> Zima (CO wznowione)");
+          bool ha_down = id(trv_ha_down_since) != 0 && now - id(trv_ha_down_since) > 5UL*60UL*1000UL;
+          bool blocked = id(trv_block_until) != 0 && (int32_t)(now - id(trv_block_until)) < 0;
+          if (fresh && winter && ha_down && !blocked && id(trv_okna) >= 2) { if (id(trv_okna_since) == 0) id(trv_okna_since) = now; }
+          else id(trv_okna_since) = 0;
+          if (id(trv_okna_since) != 0 && now - id(trv_okna_since) > 3UL*60UL*1000UL) {
+            rmw_season(true); id(trv_lato_flag) = true; id(trv_lato_since) = now; id(trv_closed_since) = 0; id(trv_okna_since) = 0;
+            ESP_LOGW("trv", "Failsafe (HA niedostepny): okna otwarte -> Lato (CO wstrzymane)");
           }
   # Power-plan executor: hourly max-power cap with LOCAL guards. Runs entirely on the ESP so it
   # survives an HA outage. Guards force FULL power: room near the comfort floor, tank below
@@ -1245,7 +1402,9 @@ out.append('''interval:
             target = id(pwr_plan)[t.hour];
             if (target < 0 || target > 3) target = 3;
             float room = id(room_temp).state, dhw = id(dhw_temp).state;
-            if (!isnan(room) && room < id(pwr_floor) + 0.5f) target = 3;
+            static bool floor_latch = false;     // enter below floor+0.5, leave at floor+0.8 (sensor flickers 0.1 K)
+            if (!isnan(room)) { if (room < id(pwr_floor) + 0.5f) floor_latch = true; else if (room >= id(pwr_floor) + 0.8f) floor_latch = false; }
+            if (floor_latch) target = 3;
             if (!isnan(dhw) && dhw < id(pwr_cwu_min)) target = 3;
             if (!isnan(dhw) && dhw > 52.0f) target = 3;
           }
@@ -1256,22 +1415,120 @@ out.append('''interval:
           id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
               id(heater), 0x0B62, 1, {wire}));
           ESP_LOGI("pwrplan", "max power -> idx %d (hour %d)", target, t.is_valid() ? t.hour : -1);
+  # Heat-request RELAY (the C.MI's mediator role, captured live 2026-10-06). On a base EKCO.MN3 the
+  # C.MG3 is a subordinate module: it decides when its circuit needs heat, but the request reaches the
+  # boiler only through the bus master, as a 2-word write to 0x0BAE every ~10 s:
+  #   idle   -> [0, 1]            (what we wrote constantly since the cutover = "no circuit wants heat")
+  #   request-> [T*10, 3]         (T = requested source supply; C.MI sent 62.0 for a 57.0 circuit target)
+  # The boiler copies T into its CO target (0x0B44 "factor") and fires. The C.MI drops back to [0, 1]
+  # while a DHW charge runs (hot water has priority). Mirror all of that here.
   - interval: 10s
     then:
       - lambda: |-
           if (!id(esp_owns_bus)) return;   // ESP silent while the C.MI owns the bus
-          auto cmd=esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
-              id(heater), 0x0BAE, 2, {0x0000, 0x0100});
-          id(heater)->queue_command(cmd);  // C.MI-style heartbeat
-  - interval: 1h
+          float sp = id(cmg3_circuit_setpoint).state;                 // C.MG3 circuit target, °C (20.0 = idle floor)
+          bool dhw = (((uint16_t) id(status_word).state) >> 8) & 1;   // boiler charging the tank
+          // The C.MI keys the request on the module's status word 0x0B52 bit2 ("heating on"), not on the
+          // setpoint: captured 2026-10-07 07:58 — setpoint stayed 43.0 but bit2 cleared and the relay went [0,1].
+          float st = id(cmg3_status_word).state;
+          bool heating = !isnan(st) && ((((uint16_t) st) >> 2) & 1);
+          bool req = heating && !isnan(sp) && sp > 20.5f && !dhw;
+          float t = sp + 5.0f; if (t > 85.0f) t = 85.0f;
+          uint16_t t10 = req ? (uint16_t)(t * 10.0f + 0.5f) : 0, f = req ? 3 : 1;
+          auto sw = [](uint16_t v){ return (uint16_t)(((v & 0xFF) << 8) | (v >> 8)); };
+          id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+              id(heater), 0x0BAE, 2, {sw(t10), sw(f)}));
+          static int last = -1;
+          if ((int) req != last) { ESP_LOGI("relay", req ? "C.MG3 requests heat -> boiler target %.1f C" : "C.MG3 idle (or DHW) -> [0,1]", t); last = req; }
+  # ---- Heater-state BROADCAST (the C.MI's second mediator job, decoded 2026-10-07) ----
+  # Every cycle the C.MI sends a Modbus broadcast (addr 0x00, fc 0x02, 36-byte payload) that the
+  # C.MG3 stores verbatim as its "źródło" mirror 0x0C61..0x0C71: outside + room temp, the four
+  # room levels, the active level index and the heater's mode flags. The module's own regulator
+  # (weather curve, room-temp decisions, external programme) runs off that mirror, and NOTHING
+  # else refreshes it: with the C.MI isolated the bus was silent for 10 min, and with the ESP
+  # mastering (no broadcast) the mirror stayed frozen for 5+ min while under the C.MI it caught
+  # up within ~80 s. Without this frame the module works on stale/zero data -> no heat request.
+  # Word map (LE words; sources pinned by single-register nudges watched on the live broadcast):
+  #  w0 1 (const)        w1 flags            w2 0          w3 0x0B8D manual setpoint
+  #  w4 0x0B68 eko       w5 0x0B6A komfort   w6 0x0B69 komfort-   w7 0x0B6B komfort+
+  #  w8 0x0B4C outside   w9 0   w10 1   w11 4 (const)     w12 0x0B4B room temp
+  #  w13 0 (fun_input_config)  w14 0x0B74 CO outside-off   w15 0x0B32 room level index
+  #  w16 1 (const)       w17 0x0B81 turbo hysteresis
+  # flags (module page reads b3 wakacje, b4 party, b5 ręczny, b6 turbo, b11 "no room temp"):
+  #  0x1003 base | 0B55.b7<<3 | 0B55.b6<<4 | 0B55.b9<<5 | 0B55.b11<<6 | 0B51.b8<<7 | 0B51.b7<<8
+  #  | 0B55.b3<<9 (lato) | 0B55.b5<<10 (zima)   — season bits captured 2026-10-07 22:52 by toggling
+  #  0x0B55 via the C.MI: winter 0x1403, summer 0x1203, off 0x1003. The C.MG3 drops its operating
+  #  mode 0x0B56 to 0 by itself when the winter bit is gone; the C.MI never writes the module for it.
+  #  (b7/b8 = the boiler's CWU/CO "grzeje" bits, in that order — matched bit-for-bit on 3 captures)
+  # Transport: ESPHome 2026.9's modbus hub refuses fc 0x01/0x02 at address 0 ("a broadcast (address 0)
+  # is never answered"), and its allow_broadcast_read path waits send_wait_time + retries per frame. So
+  # the frames go straight to the UART while the hub is idle (tx_blocked() false): CRC appended, flushed,
+  # 5 ms inter-frame gap. Found 2026-10-08 after flashing: the queued create_custom_command() variant was
+  # silently refused (112 'Command refused by hub' in 20 min) and the module mirror never moved.
+  # The hub is tx_blocked() while waiting for a response AND during its post-transaction turnaround gap,
+  # so sample often (200 ms) to land in a real idle window; 1 s sampling with the 600 ms turnaround missed
+  # ~85 % of the due frames (2026-10-08 11:13).
+  - interval: 200ms
     then:
       - lambda: |-
-          if(!id(esp_owns_bus)) return;
-          auto t=id(sntp_time).now(); if(!t.is_valid()) return;
-          auto sw=[](uint16_t v){return (uint16_t)(((v&0xFF)<<8)|(v>>8));};
-          uint16_t dow=(uint16_t)(((int)t.day_of_week+5)%7);
-          std::vector<uint16_t> w={sw((uint16_t)t.second),sw((uint16_t)t.minute),sw((uint16_t)t.hour),sw(dow),sw((uint16_t)t.day_of_month),sw((uint16_t)t.month),sw((uint16_t)(t.year-2000))};
-          id(heater)->queue_command(esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(id(heater),0x0AF6,7,w));''')
+          if (!id(esp_owns_bus)) return;   // ESP silent while the C.MI owns the bus
+          static uint32_t next_state = 0, next_clock = 0, blocked = 0;
+          uint32_t now = millis();
+          bool state_due = (int32_t)(now - next_state) >= 0, clock_due = (int32_t)(now - next_clock) >= 0;
+          if (!state_due && !clock_due) return;
+          if (id(modbus_bus)->tx_blocked()) {   // hub mid-transaction: retry next second
+            if ((++blocked % 300) == 0) ESP_LOGW("bcast", "hub busy, broadcast delayed %u ticks so far", blocked);
+            return;
+          }
+          auto raw_send = [](std::vector<uint8_t> f) {
+            uint16_t c = 0xFFFF;
+            for (uint8_t b : f) { c ^= b; for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xA001 : (c >> 1); }
+            f.push_back(c & 0xFF); f.push_back(c >> 8);
+            id(rs485)->write_array(f.data(), f.size()); id(rs485)->flush(); delay(5);   // 41 B @ 9600 ≈ 43 ms + gap
+          };
+          if (clock_due) {   // fc 0x01: year-2000, month, day, dow(0=Mon), h, m, s, 0 — once a minute
+            next_clock = now + 60000;
+            auto t = id(sntp_time).now();
+            if (t.is_valid()) {
+              raw_send({ 0x00, 0x01, 0x08, (uint8_t)(t.year - 2000), (uint8_t) t.month, (uint8_t) t.day_of_month,
+                         (uint8_t)(((int) t.day_of_week + 5) % 7), (uint8_t) t.hour, (uint8_t) t.minute, (uint8_t) t.second, 0x00 });
+              return;   // one frame per tick; a due state frame follows next second
+            }
+          }
+          if (!state_due) return;
+          next_state = now + 10000;
+          {
+            float fm = id(mode_word).state, fs = id(status_word).state, fr = id(room_temp).state,
+                  fo = id(outside_temp).state, fi = id(room_index_ro).state,
+                  f3 = id(manual_setpoint_read).state, f4 = id(room_economic_read).state,
+                  f5 = id(room_comfort_read).state, f6 = id(room_comfort_minus_read).state,
+                  f7 = id(room_comfort_plus_read).state, f14 = id(co_temp_outside_off_read).state,
+                  f17 = id(turbo_hysteresis_read).state;
+            static uint32_t skips = 0;
+            if (isnan(fm) || isnan(fs) || isnan(fo) || isnan(fi) || isnan(f3) || isnan(f4) || isnan(f5) ||
+                isnan(f6) || isnan(f7) || isnan(f14) || isnan(f17)) {
+              if ((skips++ % 30) == 0) ESP_LOGW("bcast", "state broadcast skipped: heater readings not ready");
+            } else {
+              uint16_t mw = (uint16_t) fm, stw = (uint16_t) fs;
+              uint16_t flags = 0x1003 | (((mw >> 7) & 1) << 3) | (((mw >> 6) & 1) << 4) | (((mw >> 9) & 1) << 5) |
+                               (((mw >> 11) & 1) << 6) | (((stw >> 8) & 1) << 7) | (((stw >> 7) & 1) << 8) |
+                               (((mw >> 3) & 1) << 9) | (((mw >> 5) & 1) << 10);
+              auto t10 = [](float v) { return (uint16_t)(int16_t) lroundf(v * 10.0f); };
+              uint16_t room = isnan(fr) ? (uint16_t)(int16_t) -1000 : t10(fr);
+              if (isnan(fr)) flags |= (1 << 11);
+              uint16_t w[18] = { 1, flags, 0, t10(f3), t10(f4), t10(f5), t10(f6), t10(f7), t10(fo), 0, 1, 4,
+                                 room, 0, t10(f14), (uint16_t) fi, 1, t10(f17) };
+              std::vector<uint8_t> fr8 = { 0x00, 0x02, 0x24 };
+              for (int i = 0; i < 18; i++) { fr8.push_back(w[i] & 0xFF); fr8.push_back(w[i] >> 8); }
+              raw_send(fr8);
+              static uint16_t lastf = 0xFFFF; static int lasti = -1;
+              if (flags != lastf || (int) fi != lasti) {
+                ESP_LOGI("bcast", "state broadcast: flags 0x%04X level %d room %.1f outside %.1f", flags, (int) fi, fr, fo);
+                lastf = flags; lasti = (int) fi;
+              }
+            }
+          }
+''')
 
 # Pending-write sweep: expire overdue slots into "failed", publish aggregate text sensors
 # (yellow/red banners on the dashboard key off these). Failed entries auto-clear after 10 min.
@@ -1283,7 +1540,7 @@ out.append(f'''  - interval: 5s
           uint32_t now=millis(); std::string p, f;
           for (int i=0;i<{len(WP)};i++) {{
             if (id(wp_until)[i]!=0) {{
-              if (now>id(wp_until)[i]) {{ id(wp_until)[i]=0; id(wp_failed)[i]=now; }}
+              if ((int32_t)(now-id(wp_until)[i])>0) {{ id(wp_until)[i]=0; id(wp_failed)[i]=now; }}
               else {{ if(!p.empty())p+=", "; p+=WPN[i]; }}
             }}
             if (id(wp_failed)[i]!=0) {{
@@ -1291,6 +1548,9 @@ out.append(f'''  - interval: 5s
               else {{ if(!f.empty())f+=", "; f+=WPN[i]; }}
             }}
           }}
+          auto clip=[](std::string s){{ if (s.size() <= 240) return s; size_t c = s.rfind(", ", 225);
+            return s.substr(0, c == std::string::npos ? 225 : c) + " …"; }};
+          p = clip(p); f = clip(f);
           if (!id(wp_pending_text).has_state() || p != id(wp_pending_text).state) id(wp_pending_text).publish_state(p);
           if (!id(wp_failed_text).has_state() || f != id(wp_failed_text).state) id(wp_failed_text).publish_state(f);''')
 

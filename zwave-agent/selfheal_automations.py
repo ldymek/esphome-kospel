@@ -2,7 +2,6 @@
 import json, urllib.request
 HA = "http://192.168.1.205:8123"   # EDIT ME: your HA URL
 TOK = open(".ha-token").read().strip()   # long-lived HA token, chmod 600, never commit
-
 def put(aid, body):
     req = urllib.request.Request(HA + "/api/config/automation/config/" + aid,
         data=json.dumps(body).encode(), method="POST",
@@ -20,8 +19,8 @@ def down_restart(name, health, restart_cmd, notif):
                 "notification_id": notif,
                 "title": f"Z-Wave {name}: restart kontenera",
                 "message": ("Kontroler {n} był offline -> restart {res}.\nPowód: {reason}").replace("{n}", name).replace(
-                    "{res}", "{{ 'OK' if (r.content|from_json).ok else 'NIEUDANY' }}").replace(
-                    "{reason}", "{{ (r.content|from_json).fail_reason | default(state_attr('" + health + "','error')) | default('n/d') }}")}},
+                    "{res}", "{{ 'OK' if r.content.ok else 'NIEUDANY' }}").replace(
+                    "{reason}", "{{ r.content.fail_reason | default(state_attr('" + health + "','error')) | default('n/d') }}")}},
         ],
         "mode": "single",
     }
@@ -38,12 +37,13 @@ def unreachable(name, health, notif):
         "mode": "single",
     }
 
-# HOME: container up but HA lost Z-Wave (climate.kuchnia unavailable) => likely version incompatibility -> update
+# HOME: container up but HA lost Z-Wave (>= 3 heads unavailable) => likely version incompatibility -> update
 home_incompat = {
     "alias": "Z-Wave: HOME wersja zbyt stara -> auto-update",
-    "description": "Kontener działa, ale HA straciło Z-Wave (encje niedostępne) -> aktualizacja obrazu.",
-    "trigger": [{"platform": "state", "entity_id": "climate.kuchnia", "to": "unavailable", "for": {"minutes": 10}}],
-    "condition": [{"condition": "state", "entity_id": "sensor.zwave_home_health", "state": "on"}],
+    "description": "Kontener działa, ale HA straciło Z-Wave (encje niedostępne) -> aktualizacja obrazu. Wymaga >= 3 niedostępnych głowic (jedna rozładowana bateria to nie awaria Z-Wave; 2026-10-17).",
+    "trigger": [{"platform": "state", "entity_id": "climate.glowica_kuchnia", "to": "unavailable", "for": {"minutes": 10}}],
+    "condition": [{"condition": "state", "entity_id": "sensor.zwave_home_health", "state": "on"},
+                  {"condition": "template", "value_template": "{{ ['climate.glowica_kuchnia','climate.glowica_velux','climate.glowica_balkon','climate.glowica_homeoffice','climate.glowica_sypialnia','climate.glowica_wykusz'] | select('is_state','unavailable') | list | count >= 3 }}"}],
     "action": [
         {"service": "persistent_notification.create", "data": {
             "notification_id": "zwave_home_update", "title": "Z-Wave HOME: auto-update",
@@ -52,7 +52,7 @@ home_incompat = {
         {"service": "persistent_notification.create", "data": {
             "notification_id": "zwave_home_update",
             "title": "Z-Wave HOME: wynik aktualizacji",
-            "message": "{{ (r.content|from_json) }}"}},
+            "message": "{{ r.content }}"}},
     ],
     "mode": "single",
 }
@@ -67,12 +67,12 @@ weekly = {
         {"service": "rest_command.zwave_update_home", "response_variable": "rh"},
         {"service": "persistent_notification.create", "data": {
             "notification_id": "zwave_weekly", "title": "Z-Wave update HOME",
-            "message": "{{ (rh.content|from_json) }}"}},
+            "message": "{{ rh.content }}"}},
         {"delay": {"minutes": 3}},
         {"service": "rest_command.zwave_update_garage", "response_variable": "rg"},
         {"service": "persistent_notification.create", "data": {
             "notification_id": "zwave_weekly_g", "title": "Z-Wave update GARAGE",
-            "message": "{{ (rg.content|from_json) }}"}},
+            "message": "{{ rg.content }}"}},
     ],
     "mode": "single",
 }

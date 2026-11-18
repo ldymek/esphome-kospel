@@ -1,0 +1,41 @@
+# Fibaro TRVs: 22 °C from 06:00 to 23:00, 21 °C at night; after an HA restart it applies the value for the current hour.
+# The boiler Komfort+ setpoint follows the highest TRV setpoint (input_boolean.kospel_ai_trv_nastawy).
+alias: 'TRV — harmonogram nastaw (6–23: 22 °C, noc: 21 °C)'
+description: 'Głowice Fibaro: 22 °C od 06:00 do 23:00, 21 °C poza tym oknem. Po restarcie HA ustawia wartość właściwą
+  dla bieżącej godziny. Pomija głowice wyłączone/niedostępne i te, które już mają właściwą nastawę. Kocioł (Komfort+)
+  podąża za najwyższą nastawą TRV przez sensor.kospel_ai_trv_sync.'
+triggers:
+- trigger: time
+  at: 06:00:00
+  id: dzien
+- trigger: time
+  at: '23:00:00'
+  id: noc
+- trigger: homeassistant
+  event: start
+  id: start
+conditions: []
+actions:
+- variables:
+    trvs:
+    - climate.glowica_kuchnia
+    - climate.glowica_velux
+    - climate.glowica_balkon
+    - climate.glowica_homeoffice
+    - climate.glowica_sypialnia
+    - climate.glowica_wykusz
+    cel: '{{ 22 if today_at(''06:00'') <= now() < today_at(''23:00'') else 21 }}'
+- repeat:
+    for_each: '{{ trvs | select(''is_state'',''heat'') | list }}'
+    sequence:
+    - if:
+      - condition: template
+        value_template: '{{ state_attr(repeat.item,''temperature'')|float(0) != cel|float }}'
+      then:
+      - action: climate.set_temperature
+        continue_on_error: true
+        target:
+          entity_id: '{{ repeat.item }}'
+        data:
+          temperature: '{{ cel }}'
+mode: queued

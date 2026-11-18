@@ -83,6 +83,14 @@ with ~200 entities.
    The PLN totals (`sensor.kospel_koszt_co_suma` / `_cwu_suma`) never reset and live in
    long-term statistics — a season's bill is the difference between two readings.
 
+### Automations and scripts
+
+Settings → Automations → **Create** → ⋮ **Edit in YAML**, paste one file from
+`homeassistant/automations/`, save; repeat. Do the same for `homeassistant/scripts/` under
+Settings → Scripts (the dashboards' *za zimno / za ciepło / reset* buttons call them). Replace
+`notify.mobile_app_luke_iphone` with your phone's notify service and, for the TRV ones, the
+`climate.glowica_*` / `sensor.glowica_*` entities with your own.
+
 ### Dashboards
 
 For each JSON in `homeassistant/dashboards/`: open your dashboard → ✏️ edit → ⋮ →

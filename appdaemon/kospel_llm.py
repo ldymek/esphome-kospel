@@ -9,7 +9,7 @@ Port of bin/kospel_llm.py (previously a systemd daemon on the GPU box). Same beh
 Deploy: /addon_configs/a0d7b954_appdaemon/apps/{kospel_llm.py,apps.yaml,.pstryk-key}
 """
 import appdaemon.plugins.hass.hassapi as hass
-import json, urllib.request, urllib.error, datetime, time, os, ssl
+import json, urllib.request, urllib.error, datetime, time, os, ssl, math
 import kospel_engine as eng
 
 APPDIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +28,10 @@ SYSTEM = (
  "Dom ma termostaty Fibaro (TRV) w pokojach — dane per pokój w snapshot (temp/cel/okno/grzeje). "
  "Otwarte okna (>= progu) automatycznie wstrzymują CO (tryb Lato) i wracają po zamknięciu. "
  "Kocioł ma czujnik pokojowy tylko w sypialni — do oceny domu używaj średniej i najzimniejszego pokoju. "
- "Odpowiadaj zwięźle, po polsku, konkretnie. Nie zmyślaj danych, których nie podano.")
+ "Odpowiadaj zwięźle, po polsku, konkretnie. Nie zmyślaj danych, których nie podano. "
+ "Pisz ZWYKŁYM TEKSTEM, bez LaTeX i matematyki: nie używaj znaków $, \\circ, \\text{}, \\to, \\approx, \\times; "
+ "stopnie zapisuj jako '°C', ceny jako 'PLN/kWh', zakresy jako '1,00-1,11', strzałki jako '→'. "
+ "Markdown (pogrubienie **, listy 1. 2.) jest dozwolony.")
 
 
 class KospelLLM(hass.Hass):
@@ -51,6 +54,9 @@ class KospelLLM(hass.Hass):
         self.run_daily(self.weekly_digest, "08:00:00")    # Monday report
         for sc, d in (("script.kospel_za_zimno", 1), ("script.kospel_za_cieplo", -1)):
             self.listen_state(self.override_event, sc, attribute="last_triggered", direction=d)
+        self._chat_pending = None
+        self.listen_state(self.user_message, self.CHAT_INPUT)   # free-text dialogue with the assistant
+        self.run_in(self.restore_chat, 25)
         self.run_every(self.tick, "now+10", 20)
         self.log("Kospel LLM maintainer (AppDaemon) initialized")
 
@@ -72,12 +78,17 @@ class KospelLLM(hass.Hass):
                 resp_headers.update({k.lower(): v for k, v in resp.headers.items()})
             return json.load(resp)
 
-    def ollama_chat(self, host, model, system, user, schema=None, thinking=False, temp=0.2, npredict=700):
+    TRACE_FILE = os.path.join(APPDIR, "llm_trace.json")   # last LLM_TRACE_N request/response pairs (no secrets in bodies)
+    LLM_TRACE_N = 24
+
+    def ollama_chat(self, host, model, system, user, schema=None, thinking=False, temp=0.2, npredict=700, tag="llm"):
         body = {"model": model, "stream": False, "think": bool(thinking),
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 # no num_ctx: the LLM servers are tuned per model (an override evicts weights from the GPU)
                 "options": {"temperature": temp, "num_predict": npredict, "repeat_penalty": 1.15}}
         if schema: body["format"] = schema
+        if time.time() - getattr(self, "_llm_fail_ts", 0) < self.LLM_BREAKER_S:
+            raise RuntimeError("LLM niedostępny (ostatnie wywołanie nieudane przed chwilą) — pomijam")
         t = time.time()
         key = self.llm_key()
         hdrs = {"Authorization": "Bearer " + key} if key else None
@@ -86,11 +97,23 @@ class KospelLLM(hass.Hass):
             ctx = self.llm_ssl_context() if host.lower().startswith("https://") else None
             r = self.http_json(host.rstrip("/") + "/api/chat", body, headers=hdrs, timeout=240, resp_headers=rh, context=ctx)
         except urllib.error.HTTPError as e:
+            self._llm_fail_ts = time.time()
             if e.code == 401:
                 raise RuntimeError("LLM odrzucił klucz API (HTTP 401) — sprawdź apps/.llm-key") from None
             raise
+        except Exception:
+            self._llm_fail_ts = time.time()   # breaker: the next calls fail fast instead of blocking the app thread
+            raise
         self.check_llm_auth(rh.get("x-llm-auth"), key)
-        return r["message"]["content"], time.time() - t, r.get("eval_count", 0)
+        content, secs = r["message"]["content"], time.time() - t
+        try:   # ring of recent exchanges for offline model comparisons (the body carries no credentials)
+            tr = json.load(open(self.TRACE_FILE)) if os.path.exists(self.TRACE_FILE) else []
+            tr.append({"tag": tag, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "endpoint": "/api/chat", "request": body,
+                       "response": content, "secs": round(secs, 1), "eval_count": r.get("eval_count", 0)})
+            json.dump(tr[-self.LLM_TRACE_N:], open(self.TRACE_FILE, "w"), ensure_ascii=False)
+        except Exception as ex:
+            self.log(f"llm trace err: {ex}", level="WARNING")
+        return content, secs, r.get("eval_count", 0)
 
     # ---------- supervisor REST (forecast + history; no long-lived token needed) ----------
     def sup_json(self, path, body=None, timeout=15):
@@ -115,10 +138,295 @@ class KospelLLM(hass.Hass):
             self.log(f"forecast fetch err: {type(ex).__name__} {str(ex)[:100]}", level="WARNING")
             return None
 
+    # TRV rooms; their HA devices are "Głowica <room>", so entities are climate.glowica_<room> and
+    # sensor.glowica_<room>_* (renamed 2026-10-17 to end the name clash with the Walli dimmers).
+    ROOMS = ["kuchnia", "sypialnia", "velux", "balkon", "homeoffice", "wykusz"]
+    LLM_BREAKER_S = 300            # after a failed LLM call, skip further calls this long (single app thread)
+    WRITE_SKIP_SAME_S = 6 * 3600   # an identical timetable written less than this ago is not rewritten
+
+    def house_deficit(self):
+        """TRV view of the house: mean/max shortfall below the TRV setpoints (rooms in heat mode with a
+        reading). The boiler only sees its bedroom sensor and its own (lower) room setpoints, so this is
+        the signal that tells whether the people's targets are actually met."""
+        rows = []
+        for r in self.ROOMS:
+            t = self.get_state(f"climate.glowica_{r}", attribute="current_temperature")
+            c = self.get_state(f"climate.glowica_{r}", attribute="temperature")
+            try: rows.append((r, float(t), float(c)))
+            except (TypeError, ValueError): pass
+        if not rows: return None
+        defs = [(r, round(c - t, 1)) for r, t, c in rows]
+        worst = max(defs, key=lambda x: x[1])
+        return {"nastawa_TRV_srednia_C": round(sum(c for _, _, c in rows) / len(rows), 1),
+                "temp_srednia_C": round(sum(t for _, t, _ in rows) / len(rows), 1),
+                "deficyt_sredni_K": round(sum(d for _, d in defs) / len(defs), 1),
+                "najzimniej": f"{worst[0]} ({worst[1]:+.1f} K)", "pokoi": len(rows)}
+
+    # ---------- boiler room setpoints follow the TRVs (user rule 2026-10-10) ----------
+    # The boiler/C.MG3 regulate to the boiler's own room setpoints on the bedroom sensor; when those sit
+    # below what the TRVs ask for, the rooms never get there. Rule: Komfort+ = highest TRV setpoint,
+    # Komfort = that - 0.5, Komfort- = that - 1.0 (economic setpoint untouched). Evaluated every 5 min,
+    # written only on change; toggle input_boolean.kospel_ai_trv_nastawy.
+    TRV_SYNC_EVAL_S = 300
+    TRV_SYNC_OFFS = {"heater_room_comfort_plus_temp": 0.0, "heater_room_comfort_temp": -0.5, "heater_room_comfort_minus_temp": -1.0}
+
+    def trv_setpoint_sync_tick(self):
+        if self.stt("input_boolean.kospel_ai_trv_nastawy", "on") != "on": return
+        now = time.time()
+        if now - getattr(self, "_trv_sync_ts", 0) < self.TRV_SYNC_EVAL_S: return
+        self._trv_sync_ts = now
+        tops = []
+        for r in self.ROOMS:
+            if self.stt(f"climate.glowica_{r}") != "heat": continue
+            try: tops.append(float(self.get_state(f"climate.glowica_{r}", attribute="temperature")))
+            except (TypeError, ValueError): pass
+        if not tops: return
+        top = max(tops)
+        changed = []
+        for key, off in self.TRV_SYNC_OFFS.items():
+            eid = "number.kc868_heater_" + key
+            want = round(max(10.0, min(30.0, top + off)) * 2) / 2      # 0.5 °C grid, device range
+            have = self.fnum(eid)
+            if have is None or abs(have - want) < 0.05: continue
+            self.call_service("number/set_value", entity_id=eid, value=want)
+            changed.append(f"{key.replace('heater_room_', '').replace('_temp', '')} {have:.1f}->{want:.1f}")
+            time.sleep(0.4)
+        if changed:
+            self.log(f"TRV_SYNC: najwyższa nastawa TRV {top:.1f} °C -> nastawy pokojowe kotła: " + ", ".join(changed))
+            self.set_state("sensor.kospel_ai_trv_sync", state=f"{top:.1f}",
+                           attributes={"friendly_name": "AI — nastawy kotła wg TRV", "icon": "mdi:thermostat-auto",
+                                       "unit_of_measurement": "°C", "ostatnia_zmiana": time.strftime("%Y-%m-%d %H:%M"),
+                                       "zmiany": changed})
+
+    # ---------- cold-room safety (user rules 2026-10-13 / 2026-10-17) ----------
+    # A cold room means HEAT, never "hand the boiler back". The old autonomy watchdog disengaged autonomy
+    # when the boiler's room sensor fell below kospel_ai_min_pokoj and restored the user's weekly
+    # programmes. 2026-10-13 19:38 it fired at 18.9 °C and left the house on the user's own programmes
+    # for 4 days (weekend circulation all day -> hourly tank reheats) — and the hand-back fixed nothing:
+    # the house had cooled because the boiler's outdoor cut-off (12.0 °C; outdoor 11.6-11.8 °C all
+    # afternoon) kept the C.MG3 from calling for heat while the AI plan said Komfort+ (the C.MG3 gets the
+    # cut-off in the state broadcast, word 14). Komfort+ alone does nothing in that case.
+    # Triggers (autonomy in control, winter mode, no window open):
+    #   - any TRV room (heat mode) <= input_number.kospel_ai_prog_zimny_pokoj (18.0), or
+    #   - the boiler's own room sensor < input_number.kospel_ai_min_pokoj (19.0).
+    # Action: CO program 8 -> Komfort+ all day AT ONCE (direct write: no LLM, no prices, outside the daily
+    # budget); later re-plans keep Komfort+ (engine directive) and refuse LLM CO amendments; the outdoor
+    # cut-off is held >= outdoor + 3 °C (restored on release unless the user changed it meanwhile).
+    # Release: coldest TRV >= threshold + 1 K and boiler sensor >= minimum + 0.5 K, after >= 1 h -> re-plan.
+    # Paused (state kept) while the ESP is down, the boiler is in alarm, summer mode or a window is open.
+    # Escalation: still cold after 3 h of forced heating -> one phone notification with the facts.
+    COLD_THR = "input_number.kospel_ai_prog_zimny_pokoj"
+    COLD_FLOOR = "input_number.kospel_ai_min_pokoj"
+    COLD_CUTOFF = "number.kc868_heater_heater_co_outside_off_temp"            # write
+    COLD_CUTOFF_RD = "sensor.kc868_heater_heater_co_outside_off_temp_read"    # read: the template number shows a
+    # placeholder (its minimum, 0.0) for ~5 s after every ESP boot, the register read-back shows 'unknown'
+    COLD_HYST, COLD_FLOOR_HYST, COLD_MIN_HOLD_S, COLD_ESCALATE_S = 1.0, 0.5, 3600, 3 * 3600
+    COLD_CUTOFF_MARGIN, COLD_CUTOFF_MAX, COLD_WRITE_GRACE_S = 3.0, 30.0, 180
+
+    def coldest_room(self):
+        best = None
+        for r in self.ROOMS:
+            if self.stt(f"climate.glowica_{r}") != "heat": continue
+            try: t = float(self.get_state(f"climate.glowica_{r}", attribute="current_temperature"))
+            except (TypeError, ValueError): continue
+            if best is None or t < best[1]: best = (r, t)
+        return best
+
+    def cold_guard(self):
+        return self.load_engine().get("cold_guard")
+
+    def publish_cold_guard(self, g, c, thr, floor, boiler, state=None):
+        self.set_state("sensor.kospel_ai_zimny_pokoj", state=state or ("aktywny" if g else "czuwa"),
+                       attributes={"friendly_name": "AI — straż zimnego pokoju", "icon": "mdi:snowflake-thermometer",
+                                   "prog_pokoj_TRV_C": thr, "minimum_czujnik_kotla_C": floor,
+                                   "najzimniejszy": f"{c[0]} {c[1]:.1f} °C" if c else None,
+                                   "czujnik_kotla_C": boiler,
+                                   "od": time.strftime("%Y-%m-%d %H:%M", time.localtime(g["since"])) if g else None,
+                                   "wyzwolil": g.get("why") if g else None,
+                                   "prog_wylaczenia_CO": (f"{g.get('cutoff_orig')} -> {g.get('cutoff_set')} °C"
+                                                          if g and g.get("cutoff_set") is not None else None)})
+
+    def notify_cold(self, msg, phone=False):
+        self.log("COLD_GUARD: " + msg)
+        self.call_service("persistent_notification/create", notification_id="kospel_zimny_pokoj",
+                          title="Kocioł — zimny pokój", message=msg)
+        if phone:
+            self.call_service("notify/mobile_app_luke_iphone", title="Kocioł — zimny pokój", message=msg,
+                              data={"tag": "kospel_zimny_pokoj", "group": "kociol"})
+
+    def cold_cutoff_hold(self, g, now):
+        """Keep the boiler's outdoor cut-off >= outdoor + margin while the guard holds; only ever raises it
+        during one episode (no write ping-pong as the outdoor temp wanders). Returns True if g changed."""
+        if g.get("cutoff_user"): return False
+        cur = self.fnum(self.COLD_CUTOFF_RD)
+        if cur is None: return False
+        s = g.get("cutoff_set")
+        if s is not None:
+            if abs(cur - s) <= 0.05:
+                if g.get("cutoff_tries"): g["cutoff_tries"] = 0; return True
+            else:
+                if now - g.get("cutoff_ts", 0) < self.COLD_WRITE_GRACE_S: return False   # write on its way
+                moved = abs(cur - g.get("cutoff_prev", cur)) > 0.05
+                if moved or g.get("cutoff_tries", 0) >= 3:
+                    # someone moved it (or the boiler refuses the write): stop managing it, never restore it
+                    g["cutoff_user"] = True
+                    self.log(f"COLD_GUARD: próg wyłączenia CO {'zmieniony poza AI' if moved else 'nie przyjęty przez kocioł'} "
+                             f"(jest {cur:.1f} °C, AI ustawiało {s:.1f}) — nie ruszam go", level="WARNING")
+                    return True
+        if "cutoff_orig" not in g: g["cutoff_orig"] = cur
+        tout = self.fnum("sensor.kc868_heater_heater_outside_temp")
+        need = 20.0 if tout is None else math.ceil((tout + self.COLD_CUTOFF_MARGIN) * 2) / 2
+        target = min(self.COLD_CUTOFF_MAX, max(g["cutoff_orig"], need, s or 0.0))
+        if cur >= target - 0.05: return False
+        self.call_service("number/set_value", entity_id=self.COLD_CUTOFF, value=target)
+        g.update({"cutoff_set": target, "cutoff_ts": now, "cutoff_prev": cur,
+                  "cutoff_tries": g.get("cutoff_tries", 0) + 1})
+        self.log(f"COLD_GUARD: próg wyłączenia CO {cur:.1f} -> {target:.1f} °C (na zewnątrz {tout} °C) — "
+                 "C.MG3 nie grzeje blisko progu")
+        return True
+
+    def cutoff_restore_tick(self):
+        """Give the user's outdoor cut-off back after a guard episode (survives ESP outages / restarts)."""
+        e = self.load_engine(); r = e.get("cutoff_restore")
+        if not r: return
+        cur = self.fnum(self.COLD_CUTOFF_RD)
+        if cur is None: return                                            # ESP down: try again later
+        now = time.time()
+        if abs(cur - r["orig"]) <= 0.05 or (abs(cur - r["set"]) > 0.05 and not r.get("ts")):
+            e.pop("cutoff_restore", None); self.save_engine(e)           # done, or the user moved it meanwhile
+            if abs(cur - r["orig"]) <= 0.05: self.log(f"COLD_GUARD: próg wyłączenia CO przywrócony: {cur:.1f} °C")
+            return
+        if r.get("ts") and now - r["ts"] < self.COLD_WRITE_GRACE_S: return
+        if r.get("tries", 0) >= 3:
+            e.pop("cutoff_restore", None); self.save_engine(e)
+            self.notify_cold(f"Nie udało się przywrócić progu wyłączenia CO ({r['orig']:.1f} °C, jest {cur:.1f} °C). "
+                             "Ustaw go ręcznie w ustawieniach kotła.", phone=True)
+            return
+        self.call_service("number/set_value", entity_id=self.COLD_CUTOFF, value=r["orig"])
+        r["ts"] = now; r["tries"] = r.get("tries", 0) + 1; e["cutoff_restore"] = r; self.save_engine(e)
+
+    def cold_guard_tick(self):
+        """Cold-room safety (see the block comment). Returns True when the guard was released, so the
+        caller re-plans; activation writes the CO programme itself."""
+        thr = self.fnum(self.COLD_THR, 18.0)
+        floor = self.fnum(self.COLD_FLOOR, 19.0)
+        e = self.load_engine(); g = e.get("cold_guard")
+        c = self.coldest_room()
+        boiler = self.fnum("sensor.kc868_heater_heater_room_temp")
+        a = self.load_auton()
+        now = time.time()
+        winter = self.stt("select.kc868_heater_heater_mode") == "winter"
+        # HA's own window entities (the ESP copy came from the TRV agent, which read the wrong Z-Wave bit
+        # until 2026-10-17): pause on an airing pause, on >= threshold windows, or when the coldest room's own
+        # window is open (that room is cold because of the window — heating the house does not help it)
+        windows = (self.stt("input_boolean.kospel_wietrzenie_auto") == "on"
+                   or (self.fnum("sensor.dom_otwarte_okna", 0) or 0) >= (self.fnum("input_number.kospel_okna_prog", 2.0) or 2.0)
+                   or (c is not None and str(self.stt(f"sensor.glowica_{c[0]}_open_window_detected")).lower() == "true"))
+        paused = a.get("suspended") or a.get("alarm_suspended") or a.get("esp_down_since")
+        released, state = False, None
+        if g and not a.get("active"):
+            released = True; why_end = "autonomia wyłączona"          # the user took the boiler back
+        elif g and not paused:
+            warm = (c is None or c[1] >= thr + self.COLD_HYST) and (boiler is None or boiler >= floor + self.COLD_FLOOR_HYST)
+            if warm and now - g["since"] >= self.COLD_MIN_HOLD_S:
+                released = True; why_end = (f"najzimniejszy {c[0]} {c[1]:.1f} °C" if c else "pokoje ciepłe") \
+                                           + (f", czujnik kotła {boiler:.1f} °C" if boiler is not None else "")
+            elif winter and not windows:
+                dirty = self.cold_cutoff_hold(g, now)
+                cold_still = (c is not None and c[1] <= thr) or (boiler is not None and boiler < floor)
+                if cold_still and not g.get("escalated") and now - g["since"] >= self.COLD_ESCALATE_S:
+                    g["escalated"] = True; dirty = True
+                    facts = (f"tryb {self.stt('select.kc868_heater_heater_mode')}, na zewnątrz "
+                             f"{self.stt('sensor.kc868_heater_heater_outside_temp')} °C, próg wyłączenia CO "
+                             f"{self.stt(self.COLD_CUTOFF_RD)} °C, C.MG3 żąda ciepła: "
+                             f"{self.stt('binary_sensor.kc868_heater_c_mg3_zada_ciepla')}, kocioł żąda CO: "
+                             f"{self.stt('binary_sensor.kc868_heater_heater_co_demand')}, ciśnienie "
+                             f"{self.stt('sensor.kc868_heater_heater_water_pressure')} bar, błąd "
+                             f"{self.stt('sensor.kc868_heater_heater_error')}")
+                    self.notify_cold(f"Mimo 3 h wymuszonego grzania nadal zimno ({g.get('why')}; teraz "
+                                     f"{c[0] + ' ' + format(c[1], '.1f') + ' °C' if c else '?'}). Sprawdź kocioł: {facts}.", phone=True)
+                if dirty: e["cold_guard"] = g; self.save_engine(e)
+            else:
+                state = "aktywny (wstrzymany: " + ("otwarte okno" if windows else "tryb lato") + ")"
+        elif g:
+            state = "aktywny (wstrzymany: ESP/alarm kotła)"
+        elif a.get("active") and not paused and winter and not windows:
+            why = None
+            if c is not None and c[1] <= thr: why = f"{c[0]} {c[1]:.1f} °C ≤ próg {thr:.1f} °C"
+            elif boiler is not None and boiler < floor: why = f"czujnik kotła {boiler:.1f} °C < minimum {floor:.1f} °C"
+            if why:
+                g = {"since": now, "room": c[0] if c and c[1] <= thr else "czujnik kotła",
+                     "temp": c[1] if c and c[1] <= thr else boiler, "thr": thr if c and c[1] <= thr else floor, "why": why}
+                self.cold_cutoff_hold(g, now)
+                e = self.load_engine(); e["cold_guard"] = g; self.save_engine(e)
+                self.write_plans({"CO": [(0, 1439, eng.KOMFORT_PLUS)]}, {"CO": "straż zimnego pokoju"},
+                                 self.programme8_live(), kind="guard")
+                self._pwr_sig = None
+                self.notify_cold(f"{why} — wymuszam grzanie CO (Komfort+ na cały dzień"
+                                 + (f", próg wyłączenia CO {g['cutoff_orig']:.1f} -> {g['cutoff_set']:.1f} °C"
+                                    if g.get("cutoff_set") is not None else "")
+                                 + f") do czasu, aż najzimniejszy pokój wróci do {thr + self.COLD_HYST:.1f} °C, a czujnik "
+                                 f"kotła do {floor + self.COLD_FLOOR_HYST:.1f} °C (min. 1 h).", phone=True)
+        if released:
+            e = self.load_engine(); e.pop("cold_guard", None)
+            if g.get("cutoff_set") is not None and not g.get("cutoff_user") and g.get("cutoff_orig") is not None:
+                e["cutoff_restore"] = {"orig": g["cutoff_orig"], "set": g["cutoff_set"]}
+            self.save_engine(e)
+            # the engine's own CO plan straight away (deterministic; the caller's full re-plan may be held
+            # back by the LLM toggle, missing prices or the daily write budget)
+            try:
+                prices = getattr(self, "last_prices", None)
+                if prices and a.get("active"):
+                    self.write_plans({"CO": self.engine_plan(prices)["CO"]},
+                                     {"CO": "silnik (koniec straży zimnego pokoju)"}, self.programme8_live(), kind="guard")
+            except Exception as ex:
+                self.log(f"COLD_GUARD: plan CO po zakończeniu nieudany: {type(ex).__name__} {ex}", level="WARNING")
+            self.notify_cold(f"Zimny pokój: koniec ({why_end}). Wracam do normalnego planu CO"
+                             + (f" i progu wyłączenia CO {g['cutoff_orig']:.1f} °C" if e.get("cutoff_restore") else "") + ".")
+            g = None
+        st = state or ("aktywny" if g else "czuwa")
+        if st != getattr(self, "_cold_last_state", None) or self.get_state("sensor.kospel_ai_zimny_pokoj") is None \
+                or now - getattr(self, "_cold_pub", 0) > 300:
+            self._cold_pub, self._cold_last_state = now, st
+            self.publish_cold_guard(g, c, thr, floor, boiler, st)
+        return released
+
+    def house_history_24h(self):
+        """Yesterday+today view of the house vs the TRV targets: mean, min, share of samples >1 K below
+        the mean TRV setpoint. Cached 15 min (one supervisor history call)."""
+        now = time.time()
+        c = getattr(self, "_hh24", None)
+        if c and now - c[0] < 900: return c[1]
+        start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)).isoformat()
+        out = None
+        try:
+            r = self.sup_json(f"/history/period/{start}?filter_entity_id=sensor.dom_temperatura_srednia,sensor.dom_temperatura_min"
+                              "&minimal_response&no_attributes", timeout=25)
+            hd = self.house_deficit() or {}
+            tgt = hd.get("nastawa_TRV_srednia_C")
+            for series in (r or []):
+                vals = []
+                for s in series:
+                    try: vals.append(float(s.get("state")))
+                    except (TypeError, ValueError): pass
+                if not vals: continue
+                key = "srednia" if series[0].get("entity_id", "").endswith("srednia") else "najzimniejszy_pokoj"
+                out = out or {}
+                out[key] = {"min": round(min(vals), 1), "max": round(max(vals), 1),
+                            "srednio": round(sum(vals) / len(vals), 1)}
+                if tgt is not None:
+                    out[key]["udzial_czasu_ponizej_TRV_minus_1K_pct"] = round(100 * sum(1 for v in vals if v < tgt - 1.0) / len(vals))
+        except Exception as ex:
+            self.log(f"house history err: {type(ex).__name__} {str(ex)[:100]}", level="WARNING")
+        self._hh24 = (now, out)
+        return out
+
     def fetch_history(self, hours=6):
         """Trend of key sensors over the last N hours: 'first->last (min..max)'."""
         eids = {"CWU_C": "sensor.kc868_heater_heater_dhw_temp",
                 "pokoj_C": "sensor.kc868_heater_heater_room_temp",
+                "dom_srednia_C": "sensor.dom_temperatura_srednia",
+                "dom_najzimniejszy_C": "sensor.dom_temperatura_min",
                 "zewnatrz_C": "sensor.kc868_heater_heater_outside_temp",
                 "CO_zasilanie_C": "sensor.kc868_heater_heater_co_inlet_temp",
                 "moc_kW": "sensor.kc868_heater_heater_power_now",
@@ -293,9 +601,26 @@ class KospelLLM(hass.Hass):
                                    "srednia_okna": best_avg, "oszczednosc_pct": max(save_pct, 0),
                                    "unikaj": unikaj})
 
+    def _plain(self, s):
+        """Strip LaTeX/math markup gemma sometimes emits ($...$, \\circ, \\text{}, \\to, \\approx) so HA
+        renders clean text. HUMAN FREE-TEXT ONLY — never run on the JSON plans (it removes braces)."""
+        if not s:
+            return s
+        t = str(s)
+        for a, b in (("^\\circ", "°"), ("\\circ", "°"), ("\\approx", "≈"),
+                     ("\\rightarrow", "→"), ("\\to", "→"), ("\\times", "×"), ("\\pm", "±"),
+                     ("\\leq", "≤"), ("\\geq", "≥"), ("\\le", "≤"), ("\\ge", "≥"),
+                     ("\\%", "%"), ("\\,", " "), ("\\;", " "), ("\\ ", " "),
+                     ("\\text", ""), ("\\mathrm", ""), ("\\mathbf", ""), ("\\mathit", "")):
+            t = t.replace(a, b)
+        t = t.replace("$", "").replace("{", "").replace("}", "").replace("° C", "°C")
+        while "  " in t:
+            t = t.replace("  ", " ")
+        return t
+
     def publish_analysis(self, status, text, mode, model):
         self.set_state("sensor.kospel_llm_analiza", state=status[:255],
-                       attributes={"analiza": text, "tryb": mode, "model": model,
+                       attributes={"analiza": self._plain(text), "tryb": mode, "model": model,
                                    "friendly_name": "Kospel asystent — analiza", "icon": "mdi:robot-outline"})
 
     # ---------- snapshot + LLM ----------
@@ -333,18 +658,28 @@ class KospelLLM(hass.Hass):
         }
         # per-room Fibaro TRVs (temp/cel/okno/heat-demand/battery) + house aggregates
         rooms = {}
-        for r in ["kuchnia", "sypialnia", "velux", "balkon", "homeoffice", "wykusz"]:
+        for r in self.ROOMS:
             rooms[r] = {
-                "temp": self.get_state(f"climate.{r}", attribute="current_temperature"),
-                "cel": self.get_state(f"climate.{r}", attribute="temperature"),
-                "tryb": self.stt(f"climate.{r}"),
-                "okno_otwarte": self.stt(f"sensor.{r}_open_window_detected") == "True",
-                "grzeje": self.stt(f"sensor.{r}_provide_heat") == "True",
-                "bateria_pct": self.stt(f"sensor.{r}_battery_level_1", self.stt(f"sensor.{r}_battery_level")),   # endpoint 1 = live value (root is stale)
+                "temp": self.get_state(f"climate.glowica_{r}", attribute="current_temperature"),
+                "cel": self.get_state(f"climate.glowica_{r}", attribute="temperature"),
+                "tryb": self.stt(f"climate.glowica_{r}"),
+                "okno_otwarte": self.stt(f"sensor.glowica_{r}_open_window_detected") == "True",
+                "grzeje": self.stt(f"sensor.glowica_{r}_provide_heat") == "True",
+                "bateria_pct": self.stt(f"sensor.glowica_{r}_battery_level_1"),   # endpoint 1 = the head's live battery
             }
+        for r in rooms.values():   # how far each room sits below its own TRV setpoint (the user's real target)
+            try: r["deficyt_K"] = round(float(r["cel"]) - float(r["temp"]), 1)
+            except (TypeError, ValueError): r["deficyt_K"] = None
+            # 'grzeje' (provide_heat) is live again since param 2 bit 256 "Send Heating Medium Demand Reports"
+            # was enabled on the TRVs (2026-10-10 11:52); before that it had been frozen since 2026-10-03
         snap["pokoje_TRV"] = rooms
         snap["dom_srednia_C"] = self.stt("sensor.dom_temperatura_srednia")
         snap["dom_najzimniejszy_C"] = self.stt("sensor.dom_temperatura_min")
+        snap["dom_vs_TRV"] = self.house_deficit()
+        snap["nastawy_pokojowe_kotla_C"] = {"komfort": self.stt(p.replace("sensor.", "number.") + "heater_room_comfort_temp"),
+                                           "komfort_plus": self.stt(p.replace("sensor.", "number.") + "heater_room_comfort_plus_temp"),
+                                           "komfort_minus": self.stt(p.replace("sensor.", "number.") + "heater_room_comfort_minus_temp"),
+                                           "uwaga": "kocioł/C.MG3 regulują do TYCH nastaw (czujnik w sypialni), nie do nastaw TRV"}
         snap["otwarte_okna"] = self.stt("sensor.dom_otwarte_okna")
         snap["wietrzenie_auto_wstrzymalo_CO"] = self.stt("input_boolean.kospel_wietrzenie_auto")
         return snap, price_ok
@@ -354,7 +689,7 @@ class KospelLLM(hass.Hass):
                 "\n\nWyjaśnij w 3-5 zdaniach po polsku: czy kocioł pracuje sensownie, co zwraca uwagę, "
                 "i jedną konkretną rekomendację. Jeśli brak cen prądu, powiedz to i nie planuj kosztowo.")
         return self.ollama_chat(cfg["host"], cfg["model"], SYSTEM, user,
-                                thinking=cfg["thinking"], temp=cfg["temp"], npredict=600)
+                                thinking=cfg["thinking"], temp=cfg["temp"], npredict=600, tag="advisor")
 
     def price_context(self, prices):
         """Absolute framing so the LLM knows if the WHOLE day is dear or cheap (typical PLN/kWh:
@@ -386,7 +721,7 @@ class KospelLLM(hass.Hass):
                 "Na końcu dodaj sekcję 'Sugerowane nastawy' (temperatury/krzywa — TYLKO tekstowo, "
                 "użytkownik zastosuje je ręcznie). Niczego poza tym nie zapisujesz do kotła.")
         text, dt, n = self.ollama_chat(cfg["host"], cfg["model"], SYSTEM, user,
-                                       thinking=cfg["thinking"], temp=cfg["temp"], npredict=800)
+                                       thinking=cfg["thinking"], temp=cfg["temp"], npredict=800, tag="planner")
         return text.strip(), dt, n
 
     # ================= GUARDRAILS + SUPERVISED AUTONOMY =================
@@ -397,7 +732,8 @@ class KospelLLM(hass.Hass):
     # timetables autonomy manages (-> program 8). program_c_mg3: with the boiler as "Źródło ciepła" the heating
     # circuit follows the C.MG3's own weekly map, so the CO plan is mirrored there (found 2026-09-25).
     AUTON_WEEKLY = ["program_co", "program_cwu", "program_cyrkulacji", "program_c_mg3"]
-    MAX_CONTENT_WRITES_PER_DAY = 20   # 4 scheduled runs x 4 programmes (CO, CWU, circ, C.MG3 mirror) + headroom
+    MAX_CONTENT_WRITES_PER_DAY = 32   # 4 scheduled runs x 4 programmes (CO, CWU, circ, C.MG3 mirror) + a few user
+                                      # messages (each re-plan = 4 writes; 20 was hit on 2026-10-10 by restarts + dialogue)
     CMG3_PROG_BASE = 0x0B90           # C.MG3 daily programs, program N = base + 15*(N-1)
 
     def auton_file(self): return os.path.join(APPDIR, "autonomy.json")
@@ -411,8 +747,9 @@ class KospelLLM(hass.Hass):
         except Exception as e: self.log(f"autonomy save err: {e}", level="ERROR")
 
     def publish_autonomy(self, a, note=""):
+        paused = a.get("suspended") or a.get("alarm_suspended")
         self.set_state("sensor.kospel_ai_autonomia",
-                       state="aktywna" if a.get("active") else "nieaktywna",
+                       state=("wstrzymana" if paused else "aktywna") if a.get("active") else "nieaktywna",
                        attributes={"friendly_name": "Autonomia AI", "icon": "mdi:shield-check",
                                    "kopia_tygodnia": a.get("backup"), "od": a.get("since"),
                                    "notatka": note})
@@ -491,12 +828,31 @@ class KospelLLM(hass.Hass):
         w = a.get("writes", {})
         return w.get("date") != today or w.get("count", 0) < self.MAX_CONTENT_WRITES_PER_DAY
 
-    def count_write(self):
+    def count_write(self, kind="plan"):
+        """Daily write counters. Only 'plan' writes (planner re-plans) are rate-limited; guard/safety writes
+        are counted separately (visibility, never blocked). Sandbox writes (program 8 not live) are free."""
         a = self.load_auton()
         today = time.strftime("%Y-%m-%d")
-        w = a.get("writes", {})
-        a["writes"] = {"date": today, "count": (w.get("count", 0) + 1) if w.get("date") == today else 1}
+        key = "writes" if kind == "plan" else "writes_guard"
+        w = a.get(key, {})
+        a[key] = {"date": today, "count": (w.get("count", 0) + 1) if w.get("date") == today else 1}
         self.save_auton(a)
+
+    def written_get(self, key):
+        """Last timetable actually written to program 8 (persisted: survives restarts) -> slots or None."""
+        w = (self.load_engine().get("written") or {}).get(key) or {}
+        try: return [tuple(int(x) for x in c) for c in w.get("slots", [])] or None
+        except Exception: return None
+
+    def written_put(self, key, clean):
+        e = self.load_engine(); w = e.get("written") or {}
+        w[key] = {"slots": [list(c) for c in clean], "ts": time.time()}
+        e["written"] = w; self.save_engine(e)
+
+    def written_same(self, key, clean):
+        w = (self.load_engine().get("written") or {}).get(key) or {}
+        return (self.written_get(key) == [tuple(c) for c in clean]
+                and time.time() - float(w.get("ts", 0)) < self.WRITE_SKIP_SAME_S)
 
     def engage_autonomy(self):
         a = self.load_auton()
@@ -537,7 +893,7 @@ class KospelLLM(hass.Hass):
             backup = dict(old); self.log("AUTONOMY: mapy już wskazują program 8 — zachowuję wcześniejszą kopię tygodnia")
         co = self.slots_from_sensor("sensor.kospel_ai_harmonogram")
         if co:
-            self.mirror_cmg3(co)   # queued ahead of the map writes (Modbus queue is FIFO)
+            self.mirror_cmg3(co, force=True)   # queued ahead of the map writes (Modbus queue is FIFO)
         else:
             self.log("AUTONOMY: brak planu CO do lustra C.MG3 — mapa C.MG3 wskaże program 8 z dotychczasową treścią",
                      level="WARNING")
@@ -548,7 +904,8 @@ class KospelLLM(hass.Hass):
                 time.sleep(0.4)   # a 21-call burst loses tail commands (observed: circ days never armed)
         self.run_in(self.verify_engage, 75, attempt=1)
         a.update({"active": True, "backup": backup, "since": time.strftime("%Y-%m-%d %H:%M"),
-                  "restore_pending": None, "suspended": False})
+                  "restore_pending": None, "suspended": False, "esp_down_since": None,
+                  "alarm_since": None, "alarm_suspended": False})
         self.save_auton(a)
         self.publish_autonomy(a, "tygodnie CO + CWU + cyrkulacja wskazują program 8 (AI)")
         self.notify_auton("WŁĄCZONA — ogrzewanie, ciepła woda i cyrkulacja działają według planu AI (program 8). "
@@ -625,7 +982,8 @@ class KospelLLM(hass.Hass):
         self.notify_auton(f"ESP znowu dostępny — przywrócono Twoje ustawienia:\n\n{self.week_summary(rp)}")
 
     def autonomy_tick(self, mode):
-        """Called every tick: engage/disengage on mode change + safety watchdog."""
+        """Called every tick: engage/disengage ONLY on the user's mode change; ESP outage and boiler alarm
+        pause the AI (state kept, resumes by itself); a cold house is handled by cold_guard_tick (heats)."""
         # HA-restart guard: an unavailable/unknown mode select is NOT a user action (this
         # disengaged autonomy as 'wyłączona przez użytkownika' during every HA restart).
         if mode not in ("Doradca (tylko opis)", "Propozycje (shadow)", "Autonomiczny"):
@@ -644,9 +1002,7 @@ class KospelLLM(hass.Hass):
             floor = float(self.stt("input_number.kospel_ai_min_pokoj", "19") or 19)
             try: room = float(self.stt("sensor.kc868_heater_heater_room_temp"))
             except (TypeError, ValueError): room = None
-            # 'unavailable' is NOT an alarm — it's the ESP rebooting (e.g. an OTA flash). Real
-            # alarm ("on") disengages immediately; unavailability only after a 5-min grace, when
-            # autonomy genuinely can't supervise the heater any more.
+            # 'unavailable' is NOT an alarm — it's the ESP rebooting (e.g. an OTA flash).
             # ESP unreachable: SUSPEND, do not disengage. Nothing can reach the heater during an outage
             # and a restore of the weekly maps would be lost (observed twice: autonomy flag off while
             # the maps stayed on program 8). The heater keeps running the last good program meanwhile.
@@ -662,31 +1018,41 @@ class KospelLLM(hass.Hass):
             if a.get("esp_down_since") or a.get("suspended"):
                 was = a.get("suspended")
                 a["esp_down_since"] = None; a["suspended"] = False; self.save_auton(a)
+                self._pwr_sig = None      # an ESP reboot wipes its power plan (not persisted): re-push at once
                 if was:
-                    self._pwr_sig = None                      # force a fresh power-plan push
                     self.run_in(self.verify_engage, 30, attempt=1)
                     self.publish_autonomy(a, "wznowiona po powrocie ESP")
                     self.notify_auton("WZNOWIONA — ESP znowu dostępny; sprawdzam tydzień i plan mocy.")
-            # debounce: a real boiler alarm persists; a 1-2 tick 'on' right after an ESP reboot
-            # (sensor init glitch) must not kill autonomy
+            # Boiler alarm: PAUSE the AI (no writes), never hand the boiler back. Restoring the user's
+            # weekly programmes does not fix a boiler fault and outlives it (2026-10-13: a hand-back by the
+            # old room-temperature watchdog left the house on the user's programmes for 4 days; that
+            # watchdog is now the cold-room safety, which HEATS instead — see cold_guard_tick).
+            # Debounced: a 1-2 tick 'on' right after an ESP reboot is a sensor-init glitch.
             if alarm == "on":
                 if not a.get("alarm_since"):
                     a["alarm_since"] = time.time(); self.save_auton(a)
-                elif time.time() - a["alarm_since"] > 90:
-                    self.disengage_autonomy("watchdog: alarm kotła")
-                    self.call_service("input_select/select_option",
-                                      entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
-            elif a.get("alarm_since"):
-                a["alarm_since"] = None; self.save_auton(a)
-            elif room is not None and room < floor and self.stt("select.kc868_heater_heater_mode") == "winter":
-                self.disengage_autonomy(f"watchdog: pokój {room:.1f}°C < próg {floor:.1f}°C")
-                self.call_service("input_select/select_option",
-                                  entity_id="input_select.kospel_llm_tryb", option="Propozycje (shadow)")
-            else:
-                self.power_cap_tick(room, floor)
-                self.battery_tick()
-                self.cwu_floor_tick()
-                self.season_tick()
+                elif time.time() - a["alarm_since"] > 90 and not a.get("alarm_suspended"):
+                    a["alarm_suspended"] = True; self.save_auton(a)
+                    err = self.stt("sensor.kc868_heater_heater_error")
+                    self.publish_autonomy(a, f"wstrzymana: alarm kotła ({err}) — wznowię, gdy ustąpi")
+                    self.notify_auton(f"WSTRZYMANA — alarm kotła ({err}). Kocioł zostaje na planie AI, AI nic nie "
+                                      "zapisuje, dopóki alarm nie ustąpi; potem wznowię sterowanie sama.")
+                    self.call_service("notify/mobile_app_luke_iphone", title="Kocioł — alarm",
+                                      message=f"Alarm kotła ({err}). AI wstrzymana do ustąpienia alarmu.",
+                                      data={"tag": "kospel_alarm", "group": "kociol"})
+                return
+            if a.get("alarm_since") or a.get("alarm_suspended"):
+                was = a.get("alarm_suspended")
+                a["alarm_since"] = None; a["alarm_suspended"] = False; self.save_auton(a)
+                if was:
+                    self._pwr_sig = None                      # force a fresh power-plan push
+                    self.publish_autonomy(a, "wznowiona po alarmie kotła")
+                    self.notify_auton("WZNOWIONA — alarm kotła ustąpił.")
+            self.power_cap_tick(room, floor)
+            self.battery_tick()
+            self.cwu_floor_tick()
+            self.season_tick()
+            self.curve_feedback_tick()
 
     # ---------- price-driven power plan (opt-in, autonomy only) ----------
     # The heater has no native power schedule, so the AI PUSHES a rolling 24h plan (max-power
@@ -771,6 +1137,8 @@ class KospelLLM(hass.Hass):
         e = self.load_engine()
         pref = self.stt("input_select.kospel_preferencja", "Balans")
         if pref not in eng.PREF: pref = "Balans"
+        d = self.directive()
+        if d and d.get("pref") in eng.PREF: pref = d["pref"]   # "priorytet komfort/koszt" from the user's message
         boost = self.fnum("input_number.kospel_cwu_przed_szczytem_temp", 45.0) or 45.0
         valve = self.stt("input_boolean.kospel_zawor_mieszajacy") == "on"
         if boost > 50.0 and not valve: boost = 50.0     # scald guard: above 50 C only with a mixing valve
@@ -805,6 +1173,15 @@ class KospelLLM(hass.Hass):
             h = ts.astimezone().hour
             if h in seen: continue
             seen.add(h); hours[h] = {"price": r["full"], "cheap": r["cheap"], "exp": r["exp"]}
+        # hours already past (tomorrow's, before the day-ahead prices are out) keep price=None — peak, power
+        # plan and pre-peak logic only use published prices — but carry today's price for that hour as an
+        # estimate for choosing a charge hour (it was valued at 9 zł and moved the morning charge, 2026-10-09/10)
+        today = datetime.datetime.now().date()
+        for r in prices.get("all", []):
+            try: loc = datetime.datetime.fromisoformat(r["iso"].replace("Z", "+00:00")).astimezone()
+            except Exception: continue
+            if loc.date() == today and hours[loc.hour] is None:
+                hours[loc.hour] = {"price": None, "price_est": r["full"], "cheap": False, "exp": False}
         return hours
 
     def engine_plan(self, prices):
@@ -813,10 +1190,19 @@ class KospelLLM(hass.Hass):
         u = self.dhw_load()
         usage = [round(p + t, 1) for p, t in zip(u["profile"], u["today"])]
         pr = self.prefs()
+        d = user_d = self.directive()
+        g = self.cold_guard()
+        if g:   # safety floor beats the user's "oszczędzaj" and the price: Komfort+ all day until released
+            d = dict(d or {}); d.update({"komfort": 2, "od": 0, "do": 24,
+                                         "tekst": f"zimny pokój {g['room']} {g['temp']:.1f} °C"})
+        away = self.presence_away() and not (d and d.get("komfort", 0) > 0)   # "jest mi zimno" beats a presence miss
         out = eng.plan(self.hours_from_prices(prices), usage, thermal, tank, pref=pr["pref"],
-                       away=self.presence_away(), bias=pr["bias"],
+                       away=away, bias=pr["bias"],
                        tin=self.fnum("sensor.kc868_heater_heater_room_temp"),
-                       tout=self.fnum("sensor.kc868_heater_heater_outside_temp"), battery=pr["battery"])
+                       tout=self.fnum("sensor.kc868_heater_heater_outside_temp"), battery=pr["battery"],
+                       directive=d, now_hour=datetime.datetime.now().hour)
+        out["directive"] = self.directive_human(user_d) if user_d else None
+        out["cold_guard"] = f"{g['room']} {g['temp']:.1f} °C ≤ {g['thr']:.1f} °C" if g else None
         self._last_plan = out
         return out
 
@@ -828,9 +1214,11 @@ class KospelLLM(hass.Hass):
                  "plan_mocy": ",".join(str(x) for x in out["power_plan"]),
                  "uzasadnienie": out.get("rationale", []),
                  "model_termiczny_ok": bool(m.get("thermal_ok")),
+                 "model_termiczny_zaufany": bool(m.get("thermal_trusted")), "model_termiczny_uwaga": m.get("thermal_note"),
                  "stala_czasowa_h": round(m["tau_h"], 1) if m.get("tau_h") else None,
                  "zasobnik_K_h_na_kW": m.get("tank_rate_per_kw"),
-                 "godzina_magazynu": out.get("battery_hour"), "godzina_przed_szczytem": out.get("prepeak_hour")}
+                 "godzina_magazynu": out.get("battery_hour"), "godzina_przed_szczytem": out.get("prepeak_hour"),
+                 "polecenie_uzytkownika": out.get("directive"), "zimny_pokoj": out.get("cold_guard")}
         if verify is not None: attrs["weryfikacja_llm"] = verify
         self.set_state("sensor.kospel_plan_silnika", state=time.strftime("%Y-%m-%d %H:%M"), attributes=attrs)
 
@@ -876,12 +1264,23 @@ class KospelLLM(hass.Hass):
             a = self.load_auton()
             cur = self.stt("select.kc868_heater_heater_mode")
             if cur not in ("summer", "winter"): return
+            p = a.get("season_pending")
+            if p and now - float(p.get("at", 0)) > 600:      # restart inside the 75 s verify window left it set
+                a["season_pending"] = None
+                self.log(f"SEASON: przeterminowane oczekiwanie na {p.get('target')} — kasuję", level="WARNING")
+            # airing (HA ventilation pause or the ESP failsafe) flips the season too — that is not a human
+            airing = (self.stt("input_boolean.kospel_wietrzenie_auto") == "on"
+                      or self.stt("binary_sensor.kc868_heater_trv_failsafe_lato_esp") == "on")
+            if airing: self._airing_ts = now
+            recent_airing = now - getattr(self, "_airing_ts", 0) < 900
             # detect a human change: the season moved and it was not our pending write
-            if a.get("season_pending") is None and a.get("season_seen") and cur != a["season_seen"]:
+            if a.get("season_pending") is None and a.get("season_seen") and cur != a["season_seen"] and not recent_airing:
                 a["season_user_hold_until"] = now + self.SEASON_USER_HOLD_H * 3600
                 a["season_changed_at"] = now
                 self.log(f"SEASON: ręczna zmiana na {cur} — AI nie zmienia sezonu przez {self.SEASON_USER_HOLD_H} h")
             a["season_seen"] = cur
+            if airing:
+                self.save_auton(a); return                    # no season decisions while the windows are open
             enabled = self.stt("input_boolean.kospel_ai_sezon_auto") == "on"
             hold = a.get("season_user_hold_until") or 0
             series = self.fetch_series("sensor.kc868_heater_heater_outside_temp", 24) or []
@@ -945,6 +1344,69 @@ class KospelLLM(hass.Hass):
         self.call_service("notify/mobile_app_luke_iphone", title="Kocioł — zmiana sezonu nieudana", message=msg,
                           data={"tag": "kospel_sezon", "group": "kociol"})
 
+    # ---------- AI closed-loop room-comfort trim on the C.MG3 weather curve ----------
+    # Weather mode (Pogodowy) is open-loop on room temperature: at a given outdoor temp the curve fixes
+    # the circuit supply, and the house settles at whatever that produces (observed 2026-10-05: base
+    # curve 12 held the house at ~19.6 °C, never reaching the 20.5 comfort target; and because DHW keeps
+    # the boiler hot, the low demand was always already met, so CO never actively fired). This adds the
+    # missing feedback: nudge the C.MG3 curve SHIFT (0x0B61, bundled write) toward the comfort target,
+    # hourly and in small bounded steps (building thermal lag is hours). Winter only; paused when windows
+    # open (CO suspended) or the toggle is off. If the ESP/HA dies the C.MG3 keeps the last shift + base
+    # curve, so heating survives — only the trim stops. Lever is the C.MG3 radiator circuit; the heater
+    # base curve stays where set.
+    CURVE_FB_EVAL_S = 3600          # adjust at most hourly
+    CURVE_FB_DEAD = 0.3            # °C deadband around target (no change within this)
+    CURVE_FB_GAIN = 0.6           # proportional: step = err × gain, snapped to the 1 °C write grid (shift reg is whole °C, 2026-10-07)
+    CURVE_FB_STEP_MAX = 1.5       # °C per hour cap (bigger deficit -> bigger step, still bounded)
+    CURVE_FB_SHIFT_MIN = -3.0     # whole °C; device range is ±10
+    CURVE_FB_SHIFT_MAX = 5.0      # comfort cap (device allows up to +10)
+
+    def curve_feedback_tick(self):
+        try:
+            if self.stt("input_boolean.kospel_ai_krzywa_auto", "on") == "off": return   # optional toggle
+            if self.stt("select.kc868_heater_heater_mode") != "winter": return
+            if self.stt("input_boolean.kospel_wietrzenie_auto") == "on": return   # windows open -> CO suspended
+            now = time.time()
+            if now - getattr(self, "_curve_fb_ts", 0) < self.CURVE_FB_EVAL_S: return
+            room = self.fnum("sensor.dom_temperatura_srednia") or self.fnum("sensor.kc868_heater_heater_room_temp")
+            hd = self.house_deficit()   # the people's target = mean TRV setpoint, not the boiler's own (lower) comfort temp
+            target = (hd or {}).get("nastawa_TRV_srednia_C") or self.fnum("number.kc868_heater_heater_room_comfort_temp")
+            if room is None or target is None: return
+            self._curve_fb_ts = now
+            cur = self.fnum("sensor.kc868_heater_c_mg3_heating_curve_shift_read")
+            if cur is None: cur = self.fnum("number.kc868_heater_c_mg3_heating_curve_shift", 0.0) or 0.0
+            err = round(target - room, 2)
+            if abs(err) <= self.CURVE_FB_DEAD:
+                step = 0.0
+            else:
+                raw = max(-self.CURVE_FB_STEP_MAX, min(self.CURVE_FB_STEP_MAX, err * self.CURVE_FB_GAIN))
+                step = float(round(raw))                         # snap to the 1 °C write grid
+                if step == 0.0:                                  # outside deadband -> always move one grid step
+                    step = 1.0 if err > 0 else -1.0
+            new = float(max(self.CURVE_FB_SHIFT_MIN, min(self.CURVE_FB_SHIFT_MAX, round(cur + step))))
+            self.set_state("sensor.kospel_ai_krzywa_korekta", state=round(new, 1),
+                           attributes={"friendly_name": "AI — korekta krzywej C.MG3", "icon": "mdi:tune-variant",
+                                       "unit_of_measurement": "°C", "dom_srednia": room, "cel": target,
+                                       "blad": err, "krok": step,
+                                       "ostatnia_zmiana": time.strftime("%Y-%m-%d %H:%M")})
+            if abs(new - cur) < 0.5:
+                return                                   # satisfied or already at a bound -> no write
+            self.call_service("number/set_value",
+                              entity_id="number.kc868_heater_c_mg3_heating_curve_shift", value=new)
+            self.run_in(self.verify_curve_shift, 45, target=new)
+            self.log(f"CURVE_FB: przesunięcie krzywej C.MG3 {cur:+.1f} -> {new:+.1f} °C "
+                     f"(dom {room:.1f}, cel {target:.1f}, błąd {err:+.1f})")
+        except Exception as ex:
+            self.log(f"curve_feedback error: {type(ex).__name__} {ex}", level="WARNING")
+
+    def verify_curve_shift(self, kwargs):
+        tgt = kwargs.get("target")
+        got = self.fnum("sensor.kc868_heater_c_mg3_heating_curve_shift_read")
+        if tgt is not None and got is not None and abs(got - tgt) > 0.1:
+            self.log(f"CURVE_FB: zapis przesunięcia niepotwierdzony (chcę {tgt:+.1f}, jest {got}) — ponawiam", level="WARNING")
+            self.call_service("number/set_value",
+                              entity_id="number.kc868_heater_c_mg3_heating_curve_shift", value=tgt)
+
     def cwu_floor_tick(self):
         """Self-healing guard on the ACTIVE CWU program: re-applies eng.enforce_rules (tank floor,
         no 'no-heating' level outside the night, Komfort budget, pre-peak charge) to what is written on
@@ -955,27 +1417,41 @@ class KospelLLM(hass.Hass):
             tank = self.fnum("sensor.kc868_heater_heater_dhw_temp")
             if tank is None: return
             if time.time() - getattr(self, "_floor_ts", 0) < 45 * 60: return
-            plan = getattr(self, "_cwu_written", None)
-            if plan is None:
-                st = self.get_state("sensor.kospel_ai_harmonogram_cwu", attribute="all") or {}
-                plan = self.parse_slots([{"start_min": int(p[0:2]) * 60 + int(p[3:5]), "stop_min": int(p[6:8]) * 60 + int(p[9:11]),
-                                          "level": {"Ochrona": 1, "Komfort": 2, "Komfort-": 3, "Komfort+": 4}[p.split(" ", 1)[1]]}
-                                         for p in (st.get("attributes", {}).get("przedzialy") or [])])
+            # the plan the heater really holds: persisted (survives restarts). Never invent one — after a
+            # restart the old code ran the rules on a fake [(0,60,1)] and wrote the result (2026-10-11 00:00)
+            plan = self.written_get("CWU") or self.slots_from_sensor("sensor.kospel_ai_harmonogram_cwu")
+            if not plan: return
+            if self.stt("input_boolean.kospel_llm_run_now") == "on": return     # a re-plan is about to run
+            interval_h = float(self.stt("input_number.kospel_llm_interwal_h", "6") or 6)
+            if self.stt("input_boolean.kospel_llm_enable") == "on" and \
+                    time.time() - getattr(self, "last_run", 0) >= interval_h * 3600 - 300: return   # re-plan due
             now = datetime.datetime.now(); nm = now.hour * 60 + now.minute
             active = [lv for a, b, lv in plan if a <= nm < b]
             hours = self.hours_from_prices(self.last_prices) if getattr(self, "last_prices", None) else [None] * 24
             u = self.dhw_load(); usage = [round(p + t_, 1) for p, t_ in zip(u["profile"], u["today"])]
-            fixed, notes = eng.enforce_rules("CWU", plan or [(0, 60, 1)], hours, self.prefs()["pref"], usage,
-                                             tank_temp=tank, now_hour=now.hour, away=self.presence_away())
+            fixed, notes = self.enforce_fixpoint("CWU", plan, hours, usage, tank, now.hour)
             if not notes or fixed == plan: return
+            q0, q1 = eng._to_quarters(plan), eng._to_quarters(fixed)
+            if all(q0[i] == q1[i] for i in range(nm // 15, 96)): return         # only already-past hours differ
             self._floor_ts = time.time()
             self.log(f"CWU GUARD: zasobnik {tank:.1f} C, aktywny poziom {active}; korekta -> {eng.human(fixed)} {notes}", level="WARNING")
-            self.write_plans({"CWU": fixed}, {"CWU": "korekta strażnika CWU"}, True, {"CWU": notes})
+            self.write_plans({"CWU": fixed}, {"CWU": "korekta strażnika CWU"}, True, {"CWU": notes}, kind="guard")
             if tank < eng.CWU_FLOOR_HEAT:
                 self.call_service("persistent_notification/create", notification_id="kospel_cwu_floor",
                                   title="Kocioł: zimny zasobnik CWU", message=f"Zasobnik {tank:.1f} °C. " + " ".join(notes))
         except Exception as ex:
             self.log(f"cwu_floor_tick error: {type(ex).__name__} {ex}", level="WARNING")
+
+    def enforce_fixpoint(self, key, slots, hours, usage, tank_temp, now_hour):
+        """eng.enforce_rules until it stops changing (one pass is not stable: the Komfort cap counts hours
+        before the 1 h trim, so a fresh plan was rewritten by the CWU guard 1 s later, 2026-10-09/13)."""
+        notes_all, cur = [], slots
+        for _ in range(4):
+            fixed, notes = eng.enforce_rules(key, cur, hours, self.prefs()["pref"], usage, tank_temp=tank_temp,
+                                             now_hour=now_hour, away=self.presence_away())
+            if not notes or fixed == cur: break
+            notes_all += [n for n in notes if n not in notes_all]; cur = fixed
+        return cur, notes_all
 
     def rules_hint(self, prices):
         """Explicit, price-specific hard rules for the LLM (mirrors eng.enforce_rules)."""
@@ -1011,6 +1487,21 @@ class KospelLLM(hass.Hass):
             if cold: parts.append("uzytkownik zglaszal 'za cieplo' okolo godzin: " + ",".join(cold))
         if self.presence_away(): parts.append("NIKOGO W DOMU (wszyscy poza domem >30 min) -> tryb eko")
         parts.append(f"preferencja uzytkownika: {pr['pref']}")
+        hd = self.house_deficit()
+        if hd:
+            hh = self.house_history_24h() or {}
+            s24 = hh.get("srednia") or {}
+            parts.append(f"POKOJE wg TRV: srednio {hd['temp_srednia_C']} C przy nastawie TRV {hd['nastawa_TRV_srednia_C']} C "
+                         f"(deficyt {hd['deficyt_sredni_K']:+.1f} K, najzimniej {hd['najzimniej']})"
+                         + (f"; ostatnie 24 h: srednia {s24.get('srednio')} C, min {s24.get('min')}, max {s24.get('max')}, "
+                            f"{s24.get('udzial_czasu_ponizej_TRV_minus_1K_pct')}% czasu >1 K ponizej nastawy TRV" if s24 else "")
+                         + ". Deficyt >= 1 K = dom NIE osiaga celu uzytkownika -> nie oszczedzaj kosztem komfortu, "
+                           "zalecaj cieplej / wyzsze nastawy pokojowe kotla")
+        d = self.directive()
+        if d:
+            parts.append(f"WCZESNIEJSZE POLECENIE UZYTKOWNIKA, JUZ ZASTOSOWANE w planie (wygasa {self.directive_human(d).split(' do ')[-1]}): "
+                         f"\"{d.get('tekst', '')}\" -> {self.directive_human(d).rsplit(' do ', 1)[0]}. To nie jest nowa wiadomosc. "
+                         "Uzytkownik swiadomie akceptuje koszt — nie cofaj tego planu z powodu cen pradu")
         s = self.get_state("sensor.kospel_ai_sezon", attribute="all") or {}
         sa = s.get("attributes") or {}
         if s:
@@ -1045,7 +1536,7 @@ class KospelLLM(hass.Hass):
                 schema["properties"]["slots"]["items"]["properties"]["level"]["enum"] = [1, 2]
             raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
                                           "You design heating schedules. Output ONLY JSON per schema.",
-                                          user, schema=schema, thinking=False, temp=0.1, npredict=400)
+                                          user, schema=schema, thinking=False, temp=0.1, npredict=400, tag="plan-" + tt["key"])
             try: slots = self.parse_slots(json.loads(raw).get("slots", []))
             except Exception: slots = []
             if slots: plans[tt["key"]] = slots
@@ -1068,11 +1559,15 @@ class KospelLLM(hass.Hass):
                           + (" DROGO" if r["exp"] else "") for r in prices["curve"])
         fc = ("\nPrognoza pogody:\n" + "\n".join(forecast)) if forecast else ""
         user = ("Silnik deterministyczny zaproponowal programy dzienne kotla. Jestes AUDYTOREM, nie planista. "
-                "Kryteria: zatwierdzam=true, jesli NIE znajdujesz konkretnego, policzalnego bledu (godzina + cena/pobor), "
-                "ktory pogorszylby koszt lub komfort. Uwagi stylistyczne, 'mozna lepiej', albo reguly, ktore i tak "
-                "wymusza system (noc bez grzania, limit Komfort, cyrkulacja w szczycie), NIE sa powodem odmowy. "
+                "Kryteria: zatwierdzam=true, jesli NIE znajdujesz konkretnego, policzalnego bledu, ktory pogorszylby koszt lub komfort. "
+                "KAZDA uwaga uzasadniajaca odmowe MUSI podac: godzine (HH:MM), cene w zl/kWh i szacowana roznice kWh lub zl "
+                "wzgledem planu silnika — uwaga bez tych trzech liczb zostanie zignorowana. "
+                "NIE zglaszaj (system wymusza to sam, po audycie): brak grzania CWU w nocy 22-05; limit godzin Komfort CWU; "
+                "przyciecie Komfort CWU do 1 h; ladowanie CWU przed poborem i przed szczytem cen; limit cyrkulacji w drogich "
+                "godzinach i na dobe; CO ustalone poleceniem uzytkownika. Uwagi stylistyczne i 'mozna lepiej' NIE sa powodem odmowy. "
                 "Poprawki tylko gdy zatwierdzam=false, tylko dla tabeli z bledem, i tylko TANSZE lub bezpieczniejsze niz "
-                "plan silnika (podaj godzine i cene w uwagach). Max 5 przedzialow, minuty 0-1439, poziomy "
+                "plan silnika (podaj godzine i cene w uwagach). Poprawka CO zawiera TYLKO zmieniane przedzialy — "
+                "pozostale godziny zostaja z planu silnika. Max 5 przedzialow, minuty 0-1439, poziomy "
                 "1=Ochrona(brak grzania) 2=Komfort; dla CO takze 3=Komfort- 4=Komfort+.\n\n"
                 f"PLAN SILNIKA (preferencja {out.get('pref')}, nikogo w domu={out.get('away')}):\n"
                 f"CO: {eng.human(out['CO'])}\nCWU: {eng.human(out['CWU'])}\nCyrkulacja: {eng.human(out['Cyrkulacja'])}\n"
@@ -1082,7 +1577,7 @@ class KospelLLM(hass.Hass):
         try:
             raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"],
                                           "You audit heating schedules. Output ONLY JSON per schema.",
-                                          user, schema=schema, thinking=False, temp=0.1, npredict=600)
+                                          user, schema=schema, thinking=False, temp=0.1, npredict=600, tag="verify")
             v = json.loads(raw)
         except Exception as ex:
             self.log(f"hybrid verify failed: {ex}", level="WARNING")
@@ -1116,31 +1611,64 @@ class KospelLLM(hass.Hass):
                     if lost or pre_lost:
                         rejected.append("CWU: poprawka LLM usuwa ładowanie przed poborem " + (", ".join(f"{h:02d}:00" for h in sorted(lost)) if lost else "szczytem cen") + " — zostaje plan silnika"); continue
                 if k == "Cyrkulacja":
-                    q = eng._to_quarters(clean); in_peak = sum(1 for i in range(96) if q[i] is not None and i // 4 in peak) / 4
-                    qe = eng._to_quarters(out[k]); in_peak_e = sum(1 for i in range(96) if qe[i] is not None and i // 4 in peak) / 4
+                    # overlay like CO: the auditor names the hours it changes, the rest keeps the engine plan
+                    # (2026-10-10 an amendment "00:00-01:00" replaced the whole day and dropped every morning window)
+                    qe = eng._to_quarters(out[k]); qa = eng._to_quarters(clean)
+                    clean = eng._compress_q([qa[i] if qa[i] is not None else qe[i] for i in range(96)])
+                    if clean == out[k]: continue
+                    q = eng._to_quarters(clean)
+                    night = sum(1 for i in range(0, 20) if q[i] == eng.KOMFORT and qe[i] != eng.KOMFORT)
+                    if night:
+                        rejected.append(f"Cyrkulacja: poprawka LLM dodaje krążenie w nocy 00-05 ({night/4:g} h) — zostaje plan silnika"); continue
+                    in_peak = sum(1 for i in range(96) if q[i] is not None and i // 4 in peak) / 4
+                    in_peak_e = sum(1 for i in range(96) if qe[i] is not None and i // 4 in peak) / 4
                     if in_peak > in_peak_e + 0.25:
                         rejected.append(f"Cyrkulacja: poprawka LLM dodaje krążenie w szczycie ({in_peak:g} h vs {in_peak_e:g} h) — zostaje plan silnika"); continue
+                if k == "CO" and out.get("cold_guard"):
+                    rejected.append("CO: aktywna straż zimnego pokoju — plan silnika bez poprawek LLM"); continue
+                if k == "CO" and out.get("directive"):
+                    # the engine plan already encodes the user's own instruction; the auditor must not
+                    # escalate it (seen: "+1" -> Komfort+ all day) or water it down
+                    rejected.append("CO: obowiązuje polecenie użytkownika — plan silnika bez poprawek LLM"); continue
                 if k == "CO":
-                    q = eng._to_quarters(clean); qe = eng._to_quarters(out[k])
+                    # overlay: the auditor names only the hours it changes; every other hour keeps the
+                    # engine's level. Lesson 2026-10-13: "start at 01:00" came back as the single slot
+                    # 01:00-02:00 and REPLACED the day -> 06-09/16-22 Komfort gone, no CO 03-07+, cold house.
+                    qe = eng._to_quarters(out[k]); qa = eng._to_quarters(clean)
+                    clean = eng._compress_q([qa[i] if qa[i] is not None else qe[i] for i in range(96)])
+                    if clean == out[k]: continue
+                    q = eng._to_quarters(clean)
+                    colder = sum(1 for i in range(96) if eng._WARMTH[q[i]] < eng._WARMTH[qe[i]])
+                    if colder > 4:
+                        rejected.append(f"CO: poprawka LLM chłodniejsza niż plan silnika ({colder/4:g} h) — zostaje plan silnika"); continue
                     warmer = sum(1 for i in range(96) if i // 4 in peak and (q[i] or 0) in (eng.KOMFORT, eng.KOMFORT_PLUS) and (qe[i] or 0) not in (eng.KOMFORT, eng.KOMFORT_PLUS))
                     if warmer > 4:
                         rejected.append(f"CO: poprawka LLM grzeje cieplej w szczycie cen ({warmer/4:g} h) — zostaje plan silnika"); continue
                 adj[k] = clean
+        import re as _re
+        def concrete(u):   # hour + a price/kWh figure: the minimum for an actionable objection
+            return bool(_re.search(r"\b\d{1,2}:\d{2}\b", u)) and bool(_re.search(r"\d+[.,]?\d*\s*(zl|zł|pln|kwh)", u, _re.I))
+        if v.get("zatwierdzam") is False and not adj and not any(concrete(str(u)) for u in v.get("uwagi", [])):
+            v["zatwierdzam"] = True                     # vague rejection without amendments -> approved with remarks
+            rejected.append("odmowa LLM bez konkretnych godzin/cen — traktuję jako zatwierdzenie z uwagami")
         verify = {"zatwierdzam": v.get("zatwierdzam"), "uwagi": v.get("uwagi", [])[:5],
                   "poprawione": list(adj.keys()), "odrzucone_poprawki": rejected, "czas_s": round(dt, 1)}
         self.log(f"hybrid verify: {verify}")
         return verify, adj
 
-    def mirror_cmg3(self, clean):
+    def mirror_cmg3(self, clean, live=True, kind="plan", force=False):
         """Write the CO plan into the C.MG3's program 8 (same 15-register format and levels). The C.MG3
         is what actually calls the heating circuit; the boiler's CO program only covers it."""
+        if not force and self.written_same("C.MG3", clean):
+            self.log(f"schedule -> C.MG3 program {self.AI_PROG_NR}: bez zmian, nie zapisuję"); return
         base = self.CMG3_PROG_BASE + 15 * (self.AI_PROG_NR - 1)
         # single-register writes: the C.MG3 ignores a 15-register block write (see the firmware action)
         self.call_service("esphome/kc868_heater_set_daily_program_cmg3_single", base=base,
                           starts=[c[0] for c in clean] + [65535] * (5 - len(clean)),
                           stops=[c[1] for c in clean] + [65535] * (5 - len(clean)),
                           idxs=[c[2] for c in clean] + [65535] * (5 - len(clean)))
-        self.count_write(); time.sleep(0.4)
+        if live: self.count_write(kind)
+        self.written_put("C.MG3", clean); time.sleep(0.4)
         self.log(f"schedule -> C.MG3 program {self.AI_PROG_NR} (lustro planu CO)")
 
     def migrate_cmg3(self, kwargs=None):
@@ -1162,7 +1690,7 @@ class KospelLLM(hass.Hass):
         co = self.slots_from_sensor("sensor.kospel_ai_harmonogram")
         if not co:
             self.log("AUTONOMY: migracja C.MG3 wstrzymana — brak planu CO do lustra", level="WARNING"); return
-        self.mirror_cmg3(co)
+        self.mirror_cmg3(co, force=True)
         bk.update(cur); a["backup"] = bk; self.save_auton(a)
         for d in self.DAYS:
             self.call_service("number/set_value", entity_id=f"number.kc868_heater_program_c_mg3_{d}", value=self.AI_PROG_NR)
@@ -1185,21 +1713,24 @@ class KospelLLM(hass.Hass):
                 return []
         return self.parse_slots([{"start_min": a, "stop_min": b, "level": l} for a, b, l in out])
 
-    def write_plans(self, plans, source, live, fixes=None):
+    def write_plans(self, plans, source, live, fixes=None, kind="plan"):
         lvl = {1: "Ochrona", 2: "Komfort", 3: "Komfort-", 4: "Komfort+"}
         out = {}
         for tt in self.TIMETABLES:
             clean = plans.get(tt["key"])
             if not clean: continue
-            base = tt["base"] + 15 * (self.AI_PROG_NR - 1)
-            starts = [c[0] for c in clean] + [65535] * (5 - len(clean))
-            stops = [c[1] for c in clean] + [65535] * (5 - len(clean))
-            idxs = [c[2] for c in clean] + [65535] * (5 - len(clean))
-            self.call_service("esphome/kc868_heater_set_daily_program_heater",
-                              base=base, starts=starts, stops=stops, idxs=idxs)
-            self.count_write(); time.sleep(0.4)
+            same = self.written_same(tt["key"], clean)
+            if not same:   # program 8 lives in the heater: an identical re-write is only EEPROM wear + budget
+                base = tt["base"] + 15 * (self.AI_PROG_NR - 1)
+                starts = [c[0] for c in clean] + [65535] * (5 - len(clean))
+                stops = [c[1] for c in clean] + [65535] * (5 - len(clean))
+                idxs = [c[2] for c in clean] + [65535] * (5 - len(clean))
+                self.call_service("esphome/kc868_heater_set_daily_program_heater",
+                                  base=base, starts=starts, stops=stops, idxs=idxs)
+                if live: self.count_write(kind)
+                self.written_put(tt["key"], clean); time.sleep(0.4)
             if tt["key"] == "CO":
-                self.mirror_cmg3(clean)
+                self.mirror_cmg3(clean, live, kind)
             human = [f"{a//60:02d}:{a%60:02d}-{b//60:02d}:{b%60:02d} {lvl[v]}" for a, b, v in clean]
             status_txt = ("AKTYWNY (autonomia)" if self.load_auton().get("active") else
                           "AKTYWNY (tydzień wskazuje program 8)") if live else "NIEAKTYWNY"
@@ -1212,8 +1743,8 @@ class KospelLLM(hass.Hass):
                                        "zapisano_do": f"{tt['key']} program {self.AI_PROG_NR} ({status_txt})",
                                        "aktywacja": ("steruje kotłem (Autonomiczny)" if live else
                                                      f"ustaw dzień na 8 w Programy {tt['key']} lub tryb Autonomiczny")})
-            self.log(f"schedule[{source.get(tt['key'])}] -> {tt['key']} program {self.AI_PROG_NR} [{status_txt}]: {human}")
-            if tt["key"] == "CWU": self._cwu_written = list(clean)
+            self.log(f"schedule[{source.get(tt['key'])}] -> {tt['key']} program {self.AI_PROG_NR} [{status_txt}]: {human}"
+                     + (" (bez zmian — nie zapisuję)" if same else ""))
             out[tt["key"]] = human
         return out or None
 
@@ -1242,15 +1773,24 @@ class KospelLLM(hass.Hass):
                     plans[k] = engine_out[k]
                     source[k] = "Hybryda: silnik (LLM zatwierdził)" if verify.get("zatwierdzam") else "Hybryda: silnik (uwagi LLM)"
         else:
-            plans = self.llm_plans(cfg, prices, forecast, live); source = {k: "LLM" for k in plans}
+            try:
+                plans = self.llm_plans(cfg, prices, forecast, live); source = {k: "LLM" for k in plans}
+            except Exception as ex:
+                self.log(f"LLM planner failed ({type(ex).__name__}: {str(ex)[:120]}) -> plan silnika", level="WARNING")
+                plans, source = {}, {}
+            if engine_out:
+                for k in ("CO", "CWU", "Cyrkulacja"):
+                    if k not in plans: plans[k] = engine_out[k]; source[k] = "Silnik (brak planu LLM)"
+                if engine_out.get("cold_guard") or engine_out.get("directive"):
+                    # the LLM planner never sees the cold-room floor or the user's instruction
+                    plans["CO"] = engine_out["CO"]; source["CO"] = "Silnik (polecenie / straż zimnego pokoju)"
         # programmatic guard (same rules for LLM / Silnik / Hybryda output)
         hours = self.hours_from_prices(prices); pr = self.prefs()
         u = self.dhw_load(); usage = [round(p + t_, 1) for p, t_ in zip(u["profile"], u["today"])]
         fixes = {}
         tank_t = self.fnum("sensor.kc868_heater_heater_dhw_temp")
         for k in list(plans.keys()):
-            fixed, notes = eng.enforce_rules(k, plans[k], hours, pr["pref"], usage, tank_temp=tank_t,
-                                             now_hour=datetime.datetime.now().hour, away=self.presence_away())
+            fixed, notes = self.enforce_fixpoint(k, plans[k], hours, usage, tank_t, datetime.datetime.now().hour)
             if notes:
                 plans[k] = fixed; fixes[k] = notes; source[k] = source.get(k, "?") + " + reguły"
                 self.log(f"rules[{k}]: {notes} -> {eng.human(fixed)}")
@@ -1258,9 +1798,13 @@ class KospelLLM(hass.Hass):
 
     # ================= models / learning / analytics =================
     def fetch_series(self, eid, hours):
-        start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)).isoformat()
+        # end_time is REQUIRED: HA's /history/period/<start> without it returns start + 1 day only. Until
+        # 2026-10-17 the 168 h model fits saw one day (7 days ago) + 6 days of step-held constants (tau 3-497 h,
+        # heating_seen mostly False), the pressure trend and yesterday's savings were cut the same way.
+        now = datetime.datetime.now(datetime.timezone.utc); fmt = "%Y-%m-%dT%H:%M:%SZ"
+        start, end = (now - datetime.timedelta(hours=hours)).strftime(fmt), now.strftime(fmt)
         try:
-            r = self.sup_json(f"/history/period/{start}?filter_entity_id={eid}&minimal_response&no_attributes", timeout=90)
+            r = self.sup_json(f"/history/period/{start}?end_time={end}&filter_entity_id={eid}&minimal_response&no_attributes", timeout=90)
         except Exception as ex:
             self.log(f"history {eid}: {type(ex).__name__} {str(ex)[:80]}", level="WARNING"); return []
         out = []
@@ -1283,7 +1827,7 @@ class KospelLLM(hass.Hass):
         e["thermal"], e["tank"] = th.to_dict(), tk.to_dict()
         e["bias"] = [round(b * 0.9, 2) for b in e.get("bias", [0.0] * 24)]   # overrides fade slowly
         self.save_engine(e)
-        self.set_state("sensor.kospel_model_termiczny", state="OK" if th.ok() else "uczy się",
+        self.set_state("sensor.kospel_model_termiczny", state=("OK" if th.trusted() else "niepewny") if th.ok() else "uczy się",
                        attributes={"friendly_name": "Model termiczny budynku", "icon": "mdi:home-thermometer",
                                    "stala_czasowa_h": round(th.tau_h(), 1) if th.ok() else None,
                                    "grzanie_w_danych": th.heating_seen, "probki": th.n,
@@ -1291,11 +1835,19 @@ class KospelLLM(hass.Hass):
                                    "wzmocnienie_K_h_na_kW": round(th.b * 3600, 4) if th.b else None,
                                    "zasobnik_K_h_na_kW": round(tk.rate_per_kw, 2), "zasobnik_straty_K_h": round(tk.loss_kh, 2),
                                    "zasobnik_probki": tk.n, "zasobnik_degradacja_pct": tk.degradation_pct(),
+                                   "zaufany_do_coastingu": th.trusted(), "uwaga": th.trust_issue(),
                                    "dopasowano": time.strftime("%Y-%m-%d %H:%M")})
-        self.log(f"models: thermal ok={th.ok()} tau={th.tau_h()} heating_seen={th.heating_seen} n={th.n}; tank rate={tk.rate_per_kw:.2f} loss={tk.loss_kh:.2f} n={tk.n}")
+        self.log(f"models: thermal ok={th.ok()} trusted={th.trusted()} ({th.trust_issue()}) tau={th.tau_h()} "
+                 f"heating_seen={th.heating_seen} n={th.n}; tank rate={tk.rate_per_kw:.2f} loss={tk.loss_kh:.2f} n={tk.n}")
 
     def override_event(self, entity, attribute, old, new, kwargs):
         if not new or new == old: return
+        try:   # only a fresh press counts: a script reload re-announces an OLD last_triggered (2026-10-10 10:56)
+            ts = datetime.datetime.fromisoformat(str(new).replace("Z", "+00:00"))
+            if ts.tzinfo is None: ts = ts.replace(tzinfo=datetime.timezone.utc)
+            if (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds() > 120: return
+        except Exception:
+            return
         d = kwargs.get("direction", 0); h = datetime.datetime.now().hour
         e = self.load_engine(); bias = e.get("bias", [0.0] * 24)
         for k in (h - 1, h, h + 1):
@@ -1315,13 +1867,16 @@ class KospelLLM(hass.Hass):
         # pre-peak boost: in the last cheaper hour before the price peak charge the tank higher than
         # the comfort setpoint, so a big evening draw does not force a full-power recovery at the
         # peak price (observed 2026-09-06/07: 24 kW at 1.98 zl/kWh). Off while the helper is at 45 C.
+        comfort_rd = self.fnum("sensor.kc868_heater_heater_dhw_comfort_temp_read")   # read-back: no boot placeholder
+        base = a.get("battery_orig") if a.get("battery_orig") is not None else comfort_rd
+        # compare with the user's setpoint, not with the one the boost itself raised (that flapped every ~40 s)
         want_boost = (plan.get("prepeak_hour") == hour and tank_on and not self.presence_away()
-                      and pr["boost_temp"] > (self.fnum("number.kc868_heater_heater_dhw_comfort_temp") or 99))
+                      and base is not None and pr["boost_temp"] > base)
         want = want_batt or want_boost
         target = pr["battery_temp"] if want_batt else pr["boost_temp"]
         ent = "number.kc868_heater_heater_dhw_comfort_temp"
         if want and a.get("battery_orig") is None:
-            orig = self.fnum(ent)
+            orig = comfort_rd
             if orig is None: return
             a["battery_orig"] = orig; self.save_auton(a)
             self.call_service("number/set_value", entity_id=ent, value=min(65.0, max(orig, target)))
@@ -1390,6 +1945,14 @@ class KospelLLM(hass.Hass):
                 d = json.load(open(os.path.join(APPDIR, "diag.json")))
                 self.set_state("sensor.kospel_diagnostyka", state=d["state"], attributes=d["attributes"])
                 self.log("diagnostics sensor restored after HA restart")
+            if self.get_state("sensor.kospel_oszczednosci") is None:
+                self.publish_savings(self.load_engine())       # otherwise blank until the 00:15 job
+            p = os.path.join(APPDIR, "backtest.json")
+            if self.get_state("sensor.kospel_backtest") is None and os.path.exists(p):
+                b = json.load(open(p))
+                # the dashboard labels it "wczoraj", so only bring back a backtest of yesterday's data
+                if b.get("attributes", {}).get("dzien") == time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400)):
+                    self.set_state("sensor.kospel_backtest", state=b["state"], attributes=b["attributes"])
         except Exception as ex:
             self.log(f"restore_diag: {ex}", level="WARNING")
 
@@ -1444,18 +2007,20 @@ class KospelLLM(hass.Hass):
                            tin=self.fnum("sensor.kc868_heater_heater_room_temp"),
                            tout=self.fnum("sensor.kc868_heater_heater_outside_temp"), battery=pr["battery"])
             bt = eng.backtest(out, kcwu, kco, prices)
-            self.set_state("sensor.kospel_backtest", state=str(bt["roznica"]),
-                           attributes={"friendly_name": "Backtest silnika (wczoraj)", "icon": "mdi:history",
-                                       "unit_of_measurement": "PLN", "dzien": day.strftime("%Y-%m-%d"),
-                                       "CO": eng.human(out["CO"]), "CWU": eng.human(out["CWU"]), "Cyrkulacja": eng.human(out["Cyrkulacja"]),
-                                       "kwh_co": round(sum(kco), 2), "kwh_cwu": round(sum(kcwu), 2), **bt,
-                                       "uzasadnienie": out["rationale"]})
+            attrs = {"friendly_name": "Backtest silnika (wczoraj)", "icon": "mdi:history",
+                     "unit_of_measurement": "PLN", "dzien": day.strftime("%Y-%m-%d"),
+                     "CO": eng.human(out["CO"]), "CWU": eng.human(out["CWU"]), "Cyrkulacja": eng.human(out["Cyrkulacja"]),
+                     "kwh_co": round(sum(kco), 2), "kwh_cwu": round(sum(kcwu), 2), **bt,
+                     "uzasadnienie": out["rationale"]}
+            self.set_state("sensor.kospel_backtest", state=str(bt["roznica"]), attributes=attrs)
+            try: json.dump({"state": str(bt["roznica"]), "attributes": attrs}, open(os.path.join(APPDIR, "backtest.json"), "w"), default=str)
+            except Exception: pass   # only feeds restore_diag after an HA restart
             self.log(f"backtest {day.date()}: {bt}")
         except Exception as ex:
             self.log(f"backtest error: {type(ex).__name__} {ex}", level="WARNING")
             self.set_state("sensor.kospel_backtest", state="błąd", attributes={"friendly_name": "Backtest silnika (wczoraj)", "blad": str(ex)[:200]})
 
-    LLM_LB = "https://192.168.1.27:11443"     # TLS since 2026-09-25; plain :11434 is being closed
+    LLM_LB = "https://192.168.1.27:11443"   # EDIT ME: your Ollama / load-balancer URL     # TLS since 2026-09-25; plain :11434 is being closed
     def llm_host(self):
         """Ollama base URL: helper > apps.yaml > LB default. Direct GPU hosts (.20/.21) are rewritten
         to the load balancer — calling them bypasses failover and lands the 26B on the one machine
@@ -1468,16 +2033,24 @@ class KospelLLM(hass.Hass):
             h = self.LLM_LB
         return h.rstrip("/")
 
-    def run_once(self):
-        cfg = {
+    def llm_cfg(self):
+        return {
             "host": self.llm_host(),
             "model": self.stt("input_select.kospel_llm_model", "gemma4:26b-a4b-it-qat"),
             "mode": self.stt("input_select.kospel_llm_tryb", "Doradca (tylko opis)"),
             "thinking": self.stt("input_boolean.kospel_llm_thinking") == "on",
             "temp": float(self.stt("input_number.kospel_llm_temperatura", "0.2") or 0.2),
         }
-        prices = self.fetch_prices()
-        self.publish_price_sensor(prices)
+
+    def run_once(self):
+        """One planning round. The boiler plan (engine / Hybryda / LLM planner) is written FIRST and on its own:
+        until 2026-10-17 the LLM narrative ran first in the same try, so an LLM timeout skipped the engine
+        plan too, in every planner mode, for the next interval_h hours. Returns False on any failure so the
+        tick retries sooner."""
+        cfg = self.llm_cfg()
+        fresh = self.fetch_prices()
+        if fresh: self.last_prices = fresh; self.publish_price_sensor(fresh)
+        prices = fresh or getattr(self, "last_prices", None)      # a Pstryk blip must not block the plan
         snap, price_ok = self.gather(prices)
         # enrich with real forecast + last-6h trend (read-only)
         weather = None
@@ -1489,40 +2062,262 @@ class KospelLLM(hass.Hass):
         if forecast: snap["prognoza_godzinowa"] = forecast[:12]
         trend = self.fetch_history(6)
         if trend: snap["trend_6h"] = trend
+        progs, plan_err = None, None
+        if not cfg["mode"].startswith("Doradca") and price_ok:   # program 8: sandbox, or LIVE in Autonomiczny
+            try:
+                progs = self.propose_schedule(cfg, prices, forecast)
+            except Exception as e:
+                plan_err = f"{type(e).__name__}: {str(e)[:150]}"
+                self.log(f"plan error: {plan_err}", level="ERROR")
+        llm_err = None
         try:
             if cfg["mode"].startswith("Doradca"):
                 text, dt, n = self.run_advisor(cfg, snap)
             else:
                 text, dt, n = self.run_planner(cfg, snap, price_ok, prices)
-                if price_ok:  # schedule writes to program 8 (inactive sandbox, or LIVE in Autonomiczny)
-                    progs = self.propose_schedule(cfg, prices, forecast)
-                    if progs:
-                        live = self.load_auton().get("active", False)
-                        tag = "AKTYWNE — sterują kotłem" if live else "NIEAKTYWNE (sandbox program 8)"
-                        text += f"\n\n📅 **Harmonogramy AI ({tag}):**"
-                        for key, human in progs.items():
-                            text += f"\n_{key}:_ " + "; ".join(human)
-                        text += ("\n_Aktywne w trybie Autonomiczny; wyjście przywraca poprzednie tygodnie._"
-                                 if live else "\n_Aktywacja: tryb Autonomiczny lub ustaw dzień na 8._")
-            text = text.strip()
+        except Exception as e:
+            llm_err = f"{type(e).__name__}: {str(e)[:150]}"
+            self.log(f"LLM opis niedostępny: {llm_err}", level="WARNING")
+            text, dt, n = (f"⚠ Opis asystenta niedostępny ({llm_err}). "
+                           + ("Plan kotła policzył silnik deterministyczny i został zapisany." if progs else
+                              "Brak nowego planu w tej rundzie.")), 0.0, 0
+        if progs:
+            live = self.load_auton().get("active", False)
+            tag = "AKTYWNE — sterują kotłem" if live else "NIEAKTYWNE (sandbox program 8)"
+            text += f"\n\n📅 **Harmonogramy AI ({tag}):**"
+            for key, human in progs.items():
+                text += f"\n_{key}:_ " + "; ".join(human)
+            text += ("\n_Aktywne w trybie Autonomiczny; wyjście przywraca poprzednie tygodnie._"
+                     if live else "\n_Aktywacja: tryb Autonomiczny lub ustaw dzień na 8._")
+        text = self._plain(text).strip()
+        if llm_err or plan_err:
+            status = (f"BŁĄD: {(plan_err or llm_err)[:150]}" + (" · plan zapisany" if progs else "")
+                      + f" · {time.strftime('%Y-%m-%d %H:%M')}")
+        else:
             status = f"OK · {cfg['model']} · {dt:.0f}s · {n} tok · {time.strftime('%Y-%m-%d %H:%M')}"
-            summary = text.replace("\n", " ")[:250]
+        summary = text.replace("\n", " ")[:250]
+        try:
             self.call_service("input_text/set_value", entity_id="input_text.kospel_llm_status", value=status[:255])
             self.call_service("input_text/set_value", entity_id="input_text.kospel_llm_last_summary", value=summary)
             self.call_service("persistent_notification/create", notification_id="kospel_llm",
                               title=f"Asystent AI kotła ({cfg['mode']})", message=text)
             self.publish_analysis(status, text, cfg["mode"], cfg["model"])
-            try:
-                json.dump({"status": status, "text": text, "mode": cfg["mode"], "model": cfg["model"]},
-                          open(CACHE, "w"))
-            except Exception: pass
-            self.log(status)
-            return True
+            json.dump({"status": status, "text": text, "mode": cfg["mode"], "model": cfg["model"]}, open(CACHE, "w"))
         except Exception as e:
-            err = f"BŁĄD: {type(e).__name__}: {str(e)[:180]}"
-            self.call_service("input_text/set_value", entity_id="input_text.kospel_llm_status", value=err[:255])
-            self.log(err, level="ERROR")
-            return False
+            self.log(f"publish analysis err: {e}", level="WARNING")
+        self.log(status)
+        return not (llm_err or plan_err) and (price_ok or cfg["mode"].startswith("Doradca"))
+
+    # ================= DIALOGUE: free-text messages to the assistant =================
+    # The user types e.g. "zmodyfikuj plan CO, wiem że prąd jest drogi, ale jest mi zimno" into
+    # input_text.kospel_llm_polecenie. The LLM turns it into a BOUNDED directive (warmer/cooler -2..+2,
+    # hours, validity, cost/comfort priority) plus a plain-language reply; the app validates and clamps
+    # the directive, stores it in engine.json, and the deterministic engine / power plan honour it on
+    # the next plan (which is triggered right away). The LLM never writes to the heater itself.
+    CHAT_INPUT = "input_text.kospel_llm_polecenie"
+    CHAT_SENSOR = "sensor.kospel_llm_rozmowa"
+    CHAT_MAX_H = 48
+    CHAT_SCHEMA = {"type": "object", "properties": {
+        "odpowiedz": {"type": "string"},
+        "przeplanuj": {"type": "boolean"},
+        "dyrektywa": {"type": "object", "properties": {
+            "akcja": {"type": "string", "enum": ["ustaw", "anuluj", "brak"]},
+            "komfort": {"type": "integer", "minimum": -2, "maximum": 2},
+            "godzina_od": {"type": "integer", "minimum": 0, "maximum": 23},
+            "godzina_do": {"type": "integer", "minimum": 1, "maximum": 24},
+            "wazne_godzin": {"type": "integer", "minimum": 1, "maximum": 48},
+            "priorytet": {"type": "string", "enum": ["komfort", "balans", "koszt"]},
+            "powod": {"type": "string"}},
+            # all fields required: with only "akcja" required the model answered "ustaw" and left komfort out
+            # (-> 0 -> "nothing to apply"), while its prose promised +1 (2026-10-10)
+            "required": ["akcja", "komfort", "godzina_od", "godzina_do", "wazne_godzin", "priorytet", "powod"]}},
+        "required": ["odpowiedz", "dyrektywa", "przeplanuj"]}
+    PRIO_PREF = {"komfort": "Komfort", "koszt": "Oszczędność", "balans": None}
+
+    def directive(self):
+        """Active user directive from engine.json, or None. An expired one is dropped here and the tick
+        re-plans once (flag _directive_expired)."""
+        e = self.load_engine(); d = e.get("directive")
+        if not d: return None
+        if time.time() > float(d.get("until", 0)):
+            e.pop("directive", None); self.save_engine(e)
+            self._directive_expired = True
+            self.log(f"DIALOG: polecenie wygasło: {d.get('tekst')}")
+            return None
+        return d
+
+    def directive_human(self, d):
+        if not d: return None
+        k = int(d.get("komfort", 0) or 0)
+        hs = eng.directive_hours(d)
+        span = "cały dzień" if len(hs) == 24 else f"{hs[0]:02d}:00-{(hs[-1] + 1) % 24:02d}:00"
+        parts = []
+        if k: parts.append(("cieplej" if k > 0 else "chłodniej") + f" ({k:+d}) {span}")
+        if d.get("pref"): parts.append(f"priorytet {d['pref']}")
+        lt = time.localtime(d["until"])
+        day = "" if lt.tm_yday == time.localtime().tm_yday else ("pon", "wt", "śr", "czw", "pt", "sob", "nd")[lt.tm_wday] + " "
+        return (", ".join(parts) or "bez zmian") + " do " + day + time.strftime("%H:%M", lt)
+
+    Q_WORDS = ("czy", "dlaczego", "czemu", "jak", "jaki", "jaka", "jakie", "co", "ile", "kiedy", "gdzie",
+               "ktory", "ktora", "ktore", "po co", "skad", "what", "why", "how", "when")
+    # exact imperative / polite-request forms (prefix matching caught "zrobić?" and "grzeje" — 2026-10-10)
+    REQ_WORDS = {"mozesz", "moglbys", "moglabys", "mozecie", "prosze", "zrob", "podnies", "obniz", "zwieksz",
+                 "zmniejsz", "ustaw", "wlacz", "wylacz", "anuluj", "przywroc", "zmien", "zmodyfikuj", "oszczedzaj",
+                 "grzej", "dogrzej", "podgrzej", "schlodz"}
+
+    def is_question(self, txt):
+        """Deterministic question detector (Polish, with or without diacritics). A polite request phrased as a
+        question ("czy możesz podnieść…?") counts as an instruction."""
+        import unicodedata
+        t = "".join(c for c in unicodedata.normalize("NFKD", txt.lower().replace("ł", "l")) if not unicodedata.combining(c))
+        words = [w.strip(".,!?;:\"'„”()") for w in t.split()]
+        if any(w in self.REQ_WORDS for w in words): return False
+        return t.rstrip().endswith("?") or (bool(words) and (words[0] in self.Q_WORDS or " ".join(words[:2]) in self.Q_WORDS))
+
+    def user_message(self, entity, attribute, old, new, kwargs):
+        txt = (new or "").strip()
+        if not txt or txt.lower() in ("unknown", "unavailable") or txt == (old or "").strip(): return
+        self._chat_pending = txt
+        self.run_in(self.process_message, 1)
+
+    def process_message(self, kwargs=None):
+        txt = self._chat_pending
+        if not txt: return
+        if self.busy:                                   # a scheduled run holds the LLM: retry shortly
+            self.run_in(self.process_message, 5); return
+        self.busy = True
+        try:
+            self._chat_pending = None
+            self.chat_once(txt)
+        except Exception as ex:
+            err = f"BŁĄD: {type(ex).__name__}: {str(ex)[:160]}"
+            self.log("DIALOG " + err, level="ERROR")
+            self.publish_chat(question=txt, answer=err, save=True)
+        finally:
+            self.busy = False
+
+    def chat_once(self, txt):
+        cfg = self.llm_cfg()
+        self.publish_chat(question=txt, answer="⏳ Analizuję…", pending=True)
+        prices = getattr(self, "last_prices", None) or self.fetch_prices()
+        price_ok = bool(prices and prices.get("now") is not None)
+        snap, _ = self.gather(prices)
+        curve = ("\n".join(f"{r['t_local']}: {r['full']} zł/kWh" + (" [tanio]" if r["cheap"] else "") + (" [drogo]" if r["exp"] else "")
+                           for r in prices["curve"]) + self.price_context(prices)) if price_ok else "BRAK CEN"
+        progs = "; ".join(f"{k}: " + ", ".join(self.get_state(s, attribute="przedzialy") or ["?"])
+                          for k, s in (("CO", "sensor.kospel_ai_harmonogram"), ("CWU", "sensor.kospel_ai_harmonogram_cwu"),
+                                       ("Cyrkulacja", "sensor.kospel_ai_harmonogram_cyrk")))
+        cur = self.directive()
+        now = datetime.datetime.now()
+        question = self.is_question(txt)
+        user = (f"Użytkownik napisał do asystenta kotła (teraz {now.strftime('%A %H:%M')}): „{txt}”\n"
+                + ("KLASYFIKACJA: to jest PYTANIE -> akcja=brak (odpowiedz i zaproponuj, nic nie ustawiaj).\n" if question
+                   else "KLASYFIKACJA: to może być polecenie.\n") + "\n"
+                "Stan kotła i domu:\n" + json.dumps(snap, ensure_ascii=False) +
+                "\n\nCeny energii (najbliższe godziny):\n" + curve + self.context_hint() +
+                f"\nAktualne programy AI (poziomy CO: Ochrona<ekonomiczna<Komfort-<Komfort<Komfort+): {progs}\n"
+                + (f"Wcześniejsze polecenie, JUŻ ZASTOSOWANE (nie jest częścią nowej wiadomości): „{cur.get('tekst', '')}” -> "
+                   f"{self.directive_human(cur)}\n" if cur else "Wcześniejsze polecenie: brak\n") +
+                f"Tryb asystenta: {cfg['mode']}; preferencja: {self.prefs()['pref']}.\n\n"
+                "Zinterpretuj wiadomość.\n"
+                "- Polecenie dotyczące ogrzewania (cieplej/zimniej, oszczędzaj/komfort, w jakich godzinach, na jak długo) "
+                "-> akcja=ustaw: komfort od -2 (dużo chłodniej) do +2 (dużo cieplej; 'jest mi zimno' = +1, 'bardzo zimno' = +2; "
+                "przy akcja=ustaw komfort NIE może być 0, chyba że zmienia się tylko priorytet), "
+                "godzina_od/godzina_do lokalnie (cały dzień = 0 i 24; 'wieczorem' = 16-22; 'w nocy' = 22-6), "
+                "wazne_godzin = ile godzin polecenie ma obowiązywać (domyślnie do końca dnia; 'jutro też' = 36; 'na stałe' = 48), "
+                "priorytet = co jest teraz ważniejsze dla użytkownika (komfort / koszt / balans).\n"
+                "- 'anuluj', 'wróć do normalnego planu', 'już nie jest zimno' -> akcja=anuluj.\n"
+                "- Pytanie lub uwaga ('dlaczego…', 'czy…', 'co z tym zrobić?') -> akcja=brak: odpowiedz z podanych danych i "
+                "ZAPROPONUJ działanie w odpowiedzi, ale NIE ustawiaj dyrektywy — użytkownik potwierdzi osobnym poleceniem.\n"
+                "- Jeśli obowiązujące polecenie już oznacza to samo, co nowa wiadomość -> akcja=brak i powiedz, że już obowiązuje.\n"
+                "Polecenie użytkownika ma pierwszeństwo przed ceną prądu — NIE odmawiaj, ale w odpowiedzi krótko powiedz, "
+                "co zmienisz i ile to może kosztować (które godziny dziś są drogie). przeplanuj=true, gdy dyrektywa zmienia plan. "
+                "odpowiedz: 1-4 zdania po polsku, zwykły tekst, bez markdown.")
+        raw, dt, n = self.ollama_chat(cfg["host"], cfg["model"], SYSTEM, user, schema=self.CHAT_SCHEMA,
+                                      thinking=False, temp=min(cfg["temp"], 0.3), npredict=500)
+        v = json.loads(raw)
+        dv = v.get("dyrektywa") or {}; akcja = dv.get("akcja", "brak")
+        answer = self._plain(v.get("odpowiedz", "")).strip() or "(brak odpowiedzi)"
+        notes, replan, new_d = [], False, None
+        if question and akcja != "brak":
+            # both gemma4 and a 125B model turned "czy…? dlaczego…? co z tym zrobić?" into an action (eval 2026-10-10):
+            # a question never changes the plan; the user confirms with an instruction
+            self.log(f"DIALOG: pytanie, LLM chciał akcja={akcja} — pomijam")
+            akcja = "brak"
+            notes.append("ℹ To było pytanie — niczego nie zmieniłem. Aby zastosować propozycję, napisz polecenie, "
+                         "np. „podnieś temperaturę do wieczora”.")
+        e = self.load_engine()
+        if akcja == "anuluj":
+            if e.pop("directive", None):
+                self.save_engine(e); replan = True; notes.append("✔ Polecenie anulowane — wracam do normalnego planu.")
+            else:
+                notes.append("ℹ Nie było aktywnego polecenia.")
+        elif akcja == "ustaw":
+            def _i(key, lo, hi, dflt):
+                try: return max(lo, min(hi, int(dv.get(key, dflt))))
+                except (TypeError, ValueError): return dflt
+            k = _i("komfort", -2, 2, 0)
+            od, do = _i("godzina_od", 0, 23, 0), _i("godzina_do", 1, 24, 24)
+            hrs = _i("wazne_godzin", 1, self.CHAT_MAX_H, max(2, 24 - now.hour))
+            pref = self.PRIO_PREF.get(str(dv.get("priorytet", "balans")).lower())
+            same = cur and (cur.get("komfort"), cur.get("od"), cur.get("do"), cur.get("pref")) == (k, od, do, pref)
+            if k == 0 and not pref:
+                notes.append("ℹ Wiadomość nie zmienia planu (brak konkretnego kierunku cieplej/chłodniej).")
+            elif same:   # identical to the active directive: extend its validity, no re-plan (4 heater writes saved)
+                cur["until"] = max(float(cur["until"]), time.time() + hrs * 3600); e["directive"] = cur; self.save_engine(e)
+                notes.append("ℹ To polecenie już obowiązuje — przedłużone: " + self.directive_human(cur) + ".")
+            else:
+                new_d = {"tekst": txt[:200], "komfort": k, "od": od, "do": do, "pref": pref,
+                         "until": time.time() + hrs * 3600, "powod": str(dv.get("powod", ""))[:200],
+                         "utworzono": time.strftime("%Y-%m-%d %H:%M")}
+                e["directive"] = new_d; self.save_engine(e); replan = bool(v.get("przeplanuj", True))
+                notes.append("✔ Zastosowano: " + self.directive_human(new_d) + ".")
+        self.log(f"DIALOG: „{txt}” -> LLM {json.dumps(dv, ensure_ascii=False)} przeplanuj={v.get('przeplanuj')} "
+                 f"=> akcja={akcja} dyrektywa={new_d} replan={replan} ({dt:.0f}s, {n} tok)")
+        if replan:
+            self._pwr_sig = None                              # power tiers follow the (possibly new) preference
+            if cfg["mode"].startswith("Doradca"):
+                notes.append("ℹ Tryb Doradca — plan nie jest zapisywany do kotła; przełącz na Propozycje/Autonomiczny.")
+            elif not self.rate_limit_ok():
+                notes.append("⚠ Dzienny limit zapisów do kotła wyczerpany — plan przeliczę przy następnym uruchomieniu.")
+            else:
+                self.publish_chat(question=txt, answer=answer + "\n\n" + "\n".join(notes) + "\n⏳ Przeliczam plan…", pending=True)
+                ok = self.run_once(); self.last_run = time.time()
+                live = self.load_auton().get("active", False)
+                notes.append(("✔ Plan przeliczony i zapisany do kotła (program 8" + (", aktywny" if live else ", nieaktywny") + ").")
+                             if ok else "⚠ Przeliczenie planu nie powiodło się — zobacz status asystenta.")
+        self.publish_chat(question=txt, answer=answer + ("\n\n" + "\n".join(notes) if notes else ""),
+                          model=cfg["model"], secs=dt, save=True)
+        try: self.call_service("input_text/set_value", entity_id=self.CHAT_INPUT, value="")
+        except Exception: pass
+
+    def publish_chat(self, question=None, answer=None, pending=False, model=None, secs=None, save=False, note=None):
+        """sensor.kospel_llm_rozmowa: state = short status, attributes = full question/answer + the active
+        directive. Persisted in engine.json['chat'] so it survives an HA restart (restore_chat)."""
+        e = self.load_engine()
+        prev = e.get("chat") or {}
+        if question is None: question = prev.get("pytanie")
+        if answer is None: answer = prev.get("odpowiedz")
+        if note: answer = (answer or "") + "\n\n" + note
+        d = e.get("directive")
+        ts = time.strftime("%Y-%m-%d %H:%M")
+        rec = {"pytanie": question, "odpowiedz": answer, "czas": ts, "model": model or prev.get("model"),
+               "czas_s": round(secs, 1) if secs is not None else prev.get("czas_s")}
+        if save or note:
+            e["chat"] = rec; self.save_engine(e)
+        state = "⏳ myślę…" if pending else (ts + " · " + ("polecenie aktywne" if d else "odpowiedziano"))
+        self.set_state(self.CHAT_SENSOR, state=state[:255],
+                       attributes={"friendly_name": "Asystent — rozmowa", "icon": "mdi:chat-processing-outline",
+                                   **rec, "polecenie": self.directive_human(d) if d else None,
+                                   "polecenie_tekst": (d or {}).get("tekst"),
+                                   "polecenie_do": time.strftime("%Y-%m-%d %H:%M", time.localtime(d["until"])) if d else None})
+        if save and answer:
+            self.call_service("persistent_notification/create", notification_id="kospel_llm_rozmowa",
+                              title="Asystent kotła — odpowiedź", message=f"**Ty:** {question}\n\n{answer}")
+
+    def restore_chat(self, kwargs=None):
+        if self.get_state(self.CHAT_SENSOR) is None and (self.load_engine().get("chat") or self.load_engine().get("directive")):
+            self.publish_chat()
 
     # ---------- scheduler ----------
     # ---------- meterless DHW usage profile (tank-temp draw detection) ----------
@@ -1651,9 +2446,14 @@ class KospelLLM(hass.Hass):
             except Exception as e:
                 self.log(f"dhw_usage error: {type(e).__name__} {str(e)[:120]}", level="WARNING")
             now = time.time()
-            if now - self.last_price >= 900 or self.get_state("sensor.kospel_cena_zakupu_teraz") is None:
-                self.last_prices = self.fetch_prices()   # cached for the power-cap tick
-                self.publish_price_sensor(self.last_prices)
+            if now - self.last_price >= 900 or (self.get_state("sensor.kospel_cena_zakupu_teraz") is None
+                                                 and now - self.last_price >= 120):
+                fresh = self.fetch_prices()               # cached for the power-cap tick and the guards
+                if fresh:                                 # a failed fetch keeps the last good curve (2026-10-14:
+                    self.last_prices = fresh              # a 2.3 h Pstryk outage blanked it and stopped the
+                    self.publish_price_sensor(fresh)      # power-plan heartbeat)
+                elif not hasattr(self, "last_prices"):
+                    self.last_prices = None
                 self.last_price = now
             if self.get_state("sensor.kospel_llm_analiza") is None:
                 try:
@@ -1661,6 +2461,7 @@ class KospelLLM(hass.Hass):
                     self.publish_analysis(la["status"], la["text"], la["mode"], la["model"])
                     self.log("analysis sensor restored after HA restart")
                 except Exception: pass
+                self.restore_diag()   # same HA restart: diagnostics, savings, backtest
             enabled = self.stt("input_boolean.kospel_llm_enable") == "on"
             run_now = self.stt("input_boolean.kospel_llm_run_now") == "on"
             if self.stt("input_boolean.kospel_backtest_run") == "on":
@@ -1668,11 +2469,29 @@ class KospelLLM(hass.Hass):
                 self.run_backtest()
             interval_h = float(self.stt("input_number.kospel_llm_interwal_h", "6") or 6)
             self.autonomy_tick(self.stt("input_select.kospel_llm_tryb"))
+            try: self.trv_setpoint_sync_tick()    # independent of the assistant mode: a plain user rule
+            except Exception as ex: self.log(f"trv_sync error: {type(ex).__name__} {str(ex)[:120]}", level="WARNING")
+            self.directive()                      # drops an expired user directive (sets _directive_expired)
+            if getattr(self, "_directive_expired", False):
+                self._directive_expired = False
+                self._pwr_sig = None              # power tiers may change back -> re-push
+                self.publish_chat(note="Polecenie wygasło — wracam do normalnego planu.")
+                if enabled and not self.stt("input_select.kospel_llm_tryb").startswith("Doradca"):
+                    run_now = True                # re-plan without the directive
+            try: self.cutoff_restore_tick()
+            except Exception as ex: self.log(f"cutoff_restore error: {type(ex).__name__} {str(ex)[:120]}", level="WARNING")
+            try:
+                if self.cold_guard_tick():
+                    self._pwr_sig = None
+                    if enabled and not self.stt("input_select.kospel_llm_tryb").startswith("Doradca"):
+                        run_now = True            # re-plan with / without the Komfort+ floor
+            except Exception as ex: self.log(f"cold_guard error: {type(ex).__name__} {str(ex)[:120]}", level="WARNING")
+            retry_at = now - interval_h * 3600 + 1800      # a failed round is retried after 30 min
             if run_now:
                 self.call_service("input_boolean/turn_off", entity_id="input_boolean.kospel_llm_run_now")
-                self.run_once(); self.last_run = now
+                self.last_run = now if self.run_once() else retry_at
             elif enabled and (now - self.last_run) >= interval_h * 3600:
-                self.run_once(); self.last_run = now
+                self.last_run = now if self.run_once() else retry_at
         except Exception as e:
             self.log(f"tick error: {type(e).__name__} {str(e)[:150]}", level="ERROR")
         finally:

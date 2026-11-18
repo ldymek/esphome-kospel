@@ -83,6 +83,14 @@ jedno urządzenie z ~200 encjami.
    Sumy PLN (`sensor.kospel_koszt_co_suma` / `_cwu_suma`) nigdy się nie zerują i żyją
    w statystykach długoterminowych — rachunek za sezon to różnica dwóch odczytów.
 
+### Automatyzacje i skrypty
+
+Ustawienia → Automatyzacje → **Utwórz** → ⋮ **Edytuj w YAML**, wklej jeden plik z
+`homeassistant/automations/`, zapisz; powtórz. To samo dla `homeassistant/scripts/` w
+Ustawienia → Skrypty (przyciski *za zimno / za ciepło / reset* na dashboardach je wywołują). Zamień
+`notify.mobile_app_luke_iphone` na usługę powiadomień swojego telefonu, a w automatyzacjach TRV
+encje `climate.glowica_*` / `sensor.glowica_*` na swoje.
+
 ### Dashboardy
 
 Dla każdego JSON-a z `homeassistant/dashboards/`: otwórz swój dashboard → ✏️ edytuj → ⋮ →

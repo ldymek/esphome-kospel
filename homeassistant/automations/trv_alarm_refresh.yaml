@@ -1,0 +1,48 @@
+# Fibaro FGT-001 never sends 'idle' after a fault clears, so Z-Wave JS keeps stale alarms forever.
+# After 30 min of an alarm it asks the head for its current state (Notification Get); a real fault still notifies.
+# Replace notify.mobile_app_luke_iphone with your phone's notify service (notify.mobile_app_<device>).
+alias: 'TRV: weryfikacja zawieszonych alarmów głowic'
+description: 'Fibaro FGT-001 nie wysyła ''idle'' po ustąpieniu usterki, więc Z-Wave JS trzymał stary alarm latami
+  (awaria sprzętu z 13.10.2025, ''wymień baterię'' z 2023). Gdy alarm trwa 30 min, pytam głowicę o bieżący stan
+  (Notification Get): jeśli już nic nie zgłasza, Z-Wave JS sam go wyczyści; jeśli nadal zgłasza, to prawdziwa usterka
+  i przychodzi powiadomienie. 2026-10-17.'
+mode: parallel
+triggers:
+- trigger: state
+  entity_id:
+  - binary_sensor.glowica_kuchnia_system_hardware_failure_with_failure_code
+  - binary_sensor.glowica_sypialnia_system_hardware_failure_with_failure_code
+  - binary_sensor.glowica_velux_system_hardware_failure_with_failure_code
+  - binary_sensor.glowica_balkon_system_hardware_failure_with_failure_code
+  - binary_sensor.glowica_homeoffice_system_hardware_failure_with_failure_code
+  - binary_sensor.glowica_wykusz_system_hardware_failure_with_failure_code
+  - binary_sensor.glowica_kuchnia_replace_battery_soon
+  - binary_sensor.glowica_sypialnia_replace_battery_soon
+  - binary_sensor.glowica_velux_replace_battery_soon
+  - binary_sensor.glowica_balkon_replace_battery_soon
+  - binary_sensor.glowica_homeoffice_replace_battery_soon
+  - binary_sensor.glowica_wykusz_replace_battery_soon
+  to: 'on'
+  for:
+    minutes: 30
+actions:
+- variables:
+    sprzet: '{{ ''hardware'' in trigger.entity_id }}'
+- action: zwave_js.invoke_cc_api
+  target:
+    entity_id: '{{ trigger.entity_id }}'
+  data:
+    command_class: '113'
+    endpoint: '{{ 1 if sprzet else 2 }}'
+    method_name: get
+    parameters:
+    - notificationType: '{{ 9 if sprzet else 8 }}'
+- delay:
+    minutes: 2
+- condition: template
+  value_template: '{{ is_state(trigger.entity_id, ''on'') }}'
+- action: notify.mobile_app_luke_iphone
+  data:
+    title: Głowica zgłasza usterkę
+    message: '{{ state_attr(trigger.entity_id, ''friendly_name'') }}: głowica potwierdziła problem także po ponownym
+      zapytaniu. {{ ''Sprawdź osadzenie na zaworze i wykonaj kalibrację.'' if sprzet else ''Sprawdź baterię.'' }}'

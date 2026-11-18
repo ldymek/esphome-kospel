@@ -87,7 +87,7 @@ register):
    ```
    65 10 0B 53 00 01 02 01 00      ->  write 1 to register 0x0B53 (func 0x10)
    ```
-   (one-shot, distinct from the repeating `0x0BAE` heartbeat).
+   (one-shot, distinct from the repeating `0x0BAE` heat-request relay).
 4. Reflash the master firmware and expose it — here as the **"Restart kotła (MSK)"** button, which
    writes `0x0B53 = 1`.
 

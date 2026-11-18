@@ -1,0 +1,53 @@
+# Antifreeze override: forces heating when there is a frost risk, above any price steering.
+# Acts (and notifies) only when it changes something; never writes 12 °C while the setpoint read-back is unknown.
+alias: 'Kospel: ochrona przeciwmrozowa (ESP)'
+description: 'Awaryjne wymuszenie ogrzewania przy ryzyku mrozu — nadrzędne wobec sterowania cenowego. 2026-10-17:
+  działa i powiadamia tylko, gdy coś zmienia; nie zapisuje 12 °C, gdy odczyt nastawy jest nieznany.'
+triggers:
+- platform: numeric_state
+  entity_id: sensor.kc868_heater_heater_outside_temp
+  below: 2
+  for:
+    minutes: 15
+- platform: numeric_state
+  entity_id: sensor.kc868_heater_heater_room_temp
+  below: 7
+- platform: numeric_state
+  entity_id: sensor.kc868_heater_heater_co_inlet_temp
+  below: 6
+conditions: []
+actions:
+- variables:
+    tryb_zmiana: '{{ not is_state(''select.kc868_heater_heater_mode'', ''winter'') }}'
+    komfort: '{{ states(''sensor.kc868_heater_heater_room_comfort_temp_read'') }}'
+    komfort_zmiana: '{{ is_number(komfort) and komfort|float < 12 }}'
+- if:
+  - condition: template
+    value_template: '{{ tryb_zmiana }}'
+  then:
+  - action: select.select_option
+    target:
+      entity_id: select.kc868_heater_heater_mode
+    data:
+      option: winter
+- if:
+  - condition: template
+    value_template: '{{ komfort_zmiana }}'
+  then:
+  - action: number.set_value
+    target:
+      entity_id: number.kc868_heater_heater_room_comfort_temp
+    data:
+      value: 12
+- if:
+  - condition: template
+    value_template: '{{ tryb_zmiana or komfort_zmiana }}'
+  then:
+  - action: persistent_notification.create
+    data:
+      notification_id: kospel_antifreeze
+      title: ❄ Ochrona przeciwmrozowa — wymuszono ogrzewanie
+      message: Ryzyko mrozu (zewn. {{ states('sensor.kc868_heater_heater_outside_temp') }}°C, pokój {{ states('sensor.kc868_heater_heater_room_temp')
+        }}°C, zasilanie CO {{ states('sensor.kc868_heater_heater_co_inlet_temp') }}°C).{{ ' Wymuszono tryb zimowy.'
+        if tryb_zmiana else '' }}{{ ' Nastawa Komfort podniesiona do 12 °C.' if komfort_zmiana else '' }}
+mode: single
